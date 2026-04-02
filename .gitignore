@@ -1,0 +1,10 @@
+edge-gateway
+coverage.out
+coverage.html
+.env
+deployments/config/gateway.json
+*.exe
+*.dll
+*.so
+*.dylib
+__debug_bin*

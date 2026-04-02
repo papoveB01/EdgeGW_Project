@@ -1,0 +1,31 @@
+services:
+  edge-gateway:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    container_name: edge-gateway
+    restart: always
+    ports:
+      - "8080:8080"
+    environment:
+      # ─── Hub params (from Hub admin dashboard after onboarding) ───
+      - INSTITUTION_ID=${INSTITUTION_ID:?Set INSTITUTION_ID}
+      - API_KEY=${API_KEY:?Set API_KEY}
+      - HMAC_SECRET=${HMAC_SECRET:?Set HMAC_SECRET}
+      - HUB_API_URL=${HUB_API_URL:-http://intel-api:8000/api/v1/signals}
+
+      # ─── Local params (managed by the bank, never sent to Hub) ───
+      - BANK_SALT=${BANK_SALT:?Set BANK_SALT (min 32 chars)}
+      - REGIONAL_PEPPER=${REGIONAL_PEPPER:-}
+
+      # ─── Optional ────────────────────────────────────────────────
+      - GATEWAY_PORT=8080
+      - REPORTING_THRESHOLD=${REPORTING_THRESHOLD:-10000}
+    volumes:
+      - ./config:/config:ro
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O- --timeout=5 http://localhost:8080/health || exit 1"]
+      interval: 20s
+      timeout: 10s
+      retries: 5
+      start_period: 10s

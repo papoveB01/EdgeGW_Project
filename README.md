@@ -1,164 +1,146 @@
-# Edge Gateway
+# IntelFraud Edge Gateway
 
-Privacy-preserving fraud signal gateway for financial institutions. Sits inside a bank's infrastructure, strips PII from transactions, and forwards anonymized fraud signals to the IntelFraud Hub for cross-institutional pattern detection.
-
-## Architecture
-
-```
-Bank Core System ──POST /process──> Edge Gateway ──anonymize──> Hub API
-                                         │
-                                    PII stays here
-                                    (never leaves bank)
-```
-
-**Zero PII leaves the bank.** The gateway replaces personally identifiable information with irreversible hashes (identity mosaics), privacy-preserving tiers, and geohash zones before forwarding to the Hub.
+The Privacy Wall - A hardened microservice that ensures PII never leaves your network.
 
 ## Quick Start
 
+### Prerequisites
+
+- Docker and Docker Compose
+- Go 1.21+ (for local development)
+
+### Running with Docker Compose
+
+The Edge Gateway is included in the main `docker-compose.yml`. To start it:
+
 ```bash
-# Clone
-git clone https://github.com/papoveB01/EdgeGW_Project.git
-cd EdgeGW_Project
-
-# Run tests
-make test
-
-# Build binary
-make build
-
-# Run locally (set env vars first)
-cp .env.example .env
-# Edit .env with your Hub credentials
-make run
-
-# Or with Docker
-make docker
-make docker-run
+docker compose up edge-gateway
 ```
 
-## Anonymization Pipeline
+### Configuration: Hub vs Local
 
-| Raw PII Field | Anonymized Output | Method |
-|---------------|-------------------|--------|
-| Customer ID + Name | `identity_mosaic` | SHA-256(id \| name \| bank_salt \| regional_pepper) |
-| Transaction Amount | `amount_tier` | TIER_1 (<$500), TIER_2 ($500-2.5K), TIER_3 ($2.5K-10K), TIER_4 (>$10K) |
-| Lat/Long | `location_zone` | Geohash precision 5 (~4.9km grid cells) |
-| Timestamp | Bucketed timestamp | 15-minute window rounding |
-| Account Number | `account_hash` | SHA-256(account \| bank_salt) |
-| Device ID | `device_id_hash` | SHA-256(device_id \| bank_salt) |
-| IP Address | `ip_hash` | SHA-256(ip \| bank_salt) |
-| Counterparty | `destination_mosaic` | SHA-256(counterparty_id \| bank_salt \| regional_pepper) |
+**A. Parameters provided by the Hub UI** (or downloaded via "Download Configuration"):
 
-The `identity_mosaic` uses the shared `REGIONAL_PEPPER` so the same person at different banks produces the same hash — enabling cross-bank fraud detection without exposing identity.
+- `institution_id` (env: `INSTITUTION_ID`) – e.g. BNK_001
+- `api_key` (env: `API_KEY`) – Bearer token for Hub authentication
+- `hub_endpoint_url` (env: `HUB_API_URL`) – where to send anonymized signals
 
-## API Endpoints
+**B. Parameters managed locally by the bank** (never sent to Hub):
 
-| Endpoint | Method | Description |
-|----------|--------|-------------|
-| `/health` | GET | Service health check |
-| `/metrics` | GET | Operational metrics (signals processed, failures, uptime) |
-| `/process` | POST | Accept raw transaction, anonymize, forward to Hub |
-| `/resolve-pii` | POST | Map identity_mosaic back to local PII (compliance only) |
+- `bank_salt` (env: `BANK_SALT`) – privacy key for anonymization (min 32 chars)
+- `internal_adapter_config` (env: `INTERNAL_ADAPTER_CONFIG`, JSON string) – mapping for ATM/POS ports
+- `local_log_retention` (env: `LOCAL_LOG_RETENTION_DAYS`) – audit trail retention in days (default: 90)
 
-### POST /process
-
-```json
-{
-  "id": "CUST-001",
-  "name": "John Doe",
-  "account": "ACC-1234567890",
-  "amount": 9500.00,
-  "latitude": 6.4541,
-  "longitude": 3.3947,
-  "timestamp": "2026-01-15T14:07:33.000Z",
-  "device_id": "DEV-MOBILE-001",
-  "ip": "192.168.1.100",
-  "branch_id": "LAG-01",
-  "signal_type": "transaction",
-  "endpoint_type": "MOBILE_APP",
-  "counterparty_id": "CUST-999"
-}
-```
-
-Required fields: `id`, `name`, `account`, `amount`, `latitude`, `longitude`, `timestamp`
-
-Optional fraud detection fields: `device_id`, `ip`, `branch_id`, `signal_type`, `endpoint_type`, `counterparty_id`
-
-## Configuration
+You can set these via environment variables or by mounting a config file (e.g. `/config/gateway.json`) and setting `CONFIG_PATH` if needed. See `config/config.example.json`.
 
 ### Environment Variables
 
-| Variable | Required | Description |
-|----------|----------|-------------|
-| `INSTITUTION_ID` | Yes | Your institution ID from Hub onboarding |
-| `API_KEY` | Yes | API key from Hub onboarding |
-| `HMAC_SECRET` | Yes | HMAC signing secret from Hub onboarding |
-| `HUB_API_URL` | Yes | Hub signal endpoint URL |
-| `BANK_SALT` | Yes | Local salt for hashing (min 32 chars, never shared) |
-| `REGIONAL_PEPPER` | Yes | Shared pepper from Hub (enables cross-bank matching) |
-| `GATEWAY_PORT` | No | Server port (default: 8080) |
-| `REPORTING_THRESHOLD` | No | AML reporting limit (default: 10000) |
-| `CONFIG_PATH` | No | Path to config JSON file (default: /config/gateway.json) |
+Required (env or config file):
 
-### Config File
+- `INSTITUTION_ID` / hub `institution_id`
+- `API_KEY` / hub `api_key`
+- `HUB_API_URL` / hub `hub_endpoint_url`
+- `HMAC_SECRET` – from Hub Admin at onboarding (not stored in config file for security)
+- `BANK_SALT` / local `bank_salt`
+- `REGIONAL_PEPPER` – shared regional pepper from Hub (optional for dev)
+- `GATEWAY_PORT` – port for the gateway (default: 8080)
 
-Environment variables take precedence. The config file provides defaults:
+Optional:
+
+- `CONFIG_PATH` – path to JSON config file (default: `/config/gateway.json`)
+- `INTERNAL_ADAPTER_CONFIG` – JSON object for ATM/POS adapter mapping
+- `LOCAL_LOG_RETENTION_DAYS` – local audit log retention in days (default: 90)
+
+### Testing
+
+1. **Health Check:**
+   ```bash
+   curl http://localhost:8080/health
+   ```
+
+2. **Process Transaction:**
+   ```bash
+   ./test_gateway.sh
+   ```
+
+   Or manually (minimal payload):
+   ```bash
+   curl -X POST http://localhost:8080/process \
+     -H "Content-Type: application/json" \
+     -d '{
+       "id": "1234567890",
+       "name": "John Doe",
+       "account": "ACC123456",
+       "amount": 1250.00,
+       "latitude": 6.5244,
+       "longitude": 3.3792,
+       "timestamp": "2024-02-07T12:00:00Z"
+     }'
+   ```
+
+   **With fraud-detection fields** (recommended for Midnight Sweep, Credential Stuffing, Impossible Travel):
+   ```bash
+   curl -X POST http://localhost:8080/process \
+     -H "Content-Type: application/json" \
+     -d '{
+       "id": "1234567890",
+       "name": "John Doe",
+       "account": "ACC123456",
+       "amount": 1250.00,
+       "latitude": 6.5244,
+       "longitude": 3.3792,
+       "timestamp": "2024-02-07T12:00:00Z",
+       "device_id": "HW-ABC-123",
+       "branch_id": "LAG-01",
+       "ip": "10.0.1.5"
+     }'
+   ```
+   - `device_id` or `device_id_hash`: enables Credential Stuffing (cross-bank) and Midnight Sweep. Gateway hashes `device_id` if provided; or pass pre-hashed `device_id_hash`.
+   - `branch_id`: enables Impossible Travel (physical ATM/branch; must match Hub `branch_locations`).
+   - `ip` or `ip_hash`: optional anchor for Midnight Sweep.
+
+### Building the Docker Image
 
 ```bash
-cp deployments/config/gateway.example.json deployments/config/gateway.json
-# Edit with your values
+cd edge-gateway
+docker build -t edge-gateway:latest .
 ```
 
-## Hub Authentication
+### Optional request fields (fraud detection)
 
-The gateway authenticates to the Hub using a 3-point handshake:
+For full Hub fraud detection, the Core Banking System can send these optional fields in the `/process` JSON body:
 
-1. **API Key** — `Authorization: Bearer <API_KEY>` header
-2. **HMAC Signature** — `X-Intel-Signature: HMAC-SHA256(payload, HMAC_SECRET)` header
-3. **Hub validates** institution is active and within rate limits
+| Field | Purpose | Hub use |
+|-------|---------|--------|
+| `device_id` | Device/hardware identifier | Hashed and sent as `metadata.device_id_hash` → Credential Stuffing (cross-bank), Midnight Sweep |
+| `device_id_hash` | Pre-hashed device fingerprint | Passed through as `metadata.device_id_hash` |
+| `ip` | Client IP | Hashed and sent as `metadata.ip_hash` → Midnight Sweep |
+| `ip_hash` | Pre-hashed IP | Passed through as `metadata.ip_hash` |
+| `branch_id` | Physical ATM/branch code (e.g. LAG-01) | Sent as `metadata.branch_id` → Impossible Travel; must exist in Hub `branch_locations` |
+| `signal_type` | e.g. `transaction`, `login` | Default `transaction` |
+| `endpoint_type` | e.g. `BRANCH`, `ATM`, `MOBILE` | Stored in metadata |
 
-## Security Features
+**Edge Gateway must reliably pass `device_fingerprint` (or `device_id_hash`) for cross-bank Credential Stuffing and Midnight Sweep.** Coordinates should reflect the physical ATM/branch location (and `branch_id` set) for Impossible Travel.
 
-- **Distroless container** — no shell, no package manager, nonroot user
-- **Zero PII transmission** — all personal data hashed before leaving the bank
-- **HMAC-SHA256 payload signing** — tamper-proof signal integrity
-- **Request body size limit** — 1MB max to prevent OOM attacks
-- **Structured JSON logging** — no PII in logs
-- **Graceful shutdown** — SIGINT/SIGTERM handling
-- **Retry with exponential backoff** — resilient Hub connectivity
+**Multi-Bank Structuring (Smurfing):** The gateway maps amounts to tiers and sets `metadata.is_near_threshold = true` when the transaction amount is within 5% of the AML reporting threshold (configurable via `reporting_threshold` in local config or `REPORTING_THRESHOLD` env, default 10000). This lets the Hub distinguish "just below" patterns (e.g. two $9.9k at different banks) from normal activity.
 
-## Development
+### Architecture
 
-```bash
-# Run tests with race detector
-make test
+- **processor/**: Core anonymization logic (hashing, tiering, geohash); adds device_id_hash, ip_hash, branch_id to metadata when provided
+- **adapters/**: Inbound (REST) and outbound (Hub communication)
+- **main.go**: HTTP server and request routing
 
-# Generate coverage report
-make test-cover
+### Security Features
 
-# Lint
-make lint
+- Distroless Docker image (no shell, minimal attack surface)
+- HMAC-SHA256 payload signing
+- TLS 1.3 communication with Hub
+- Zero PII leakage (all data anonymized before transmission)
 
-# Build and run
-make build && ./edge-gateway
-```
+### Performance
 
-## Project Structure
+- Sub-10ms processing time
+- High concurrency (Go-based)
+- Stateless design (no database)
 
-```
-EdgeGW_Project/
-  cmd/gateway/          # Application entry point
-    main.go
-  internal/
-    adapters/           # Inbound request parsing, Hub forwarding, metrics
-    config/             # Configuration loading (env + file)
-    middleware/          # Request logging, body size limit
-    processor/          # Core anonymization logic + tests
-  deployments/          # Docker Compose + config templates
-  scripts/              # Integration test scripts
-  .github/workflows/    # CI pipeline
-```
 
-## License
-
-Proprietary. Part of the IntelFraud platform.

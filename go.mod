@@ -1,3 +1,4 @@
-module github.com/papoveB01/EdgeGW_Project
+module edge-gateway
 
-go 1.22
+go 1.21
+

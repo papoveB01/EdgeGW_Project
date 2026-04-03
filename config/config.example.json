@@ -1,0 +1,17 @@
+{
+  "hub": {
+    "institution_id": "BNK_001",
+    "api_key": "<Bearer token from Hub Admin - set via env or secure secret in production>",
+    "hub_endpoint_url": "https://your-hub.example.com/api/v1/signals"
+  },
+  "local": {
+    "bank_salt": "<high-entropy secret, min 32 chars - keep local only>",
+    "internal_adapter_config": {
+      "atm": { "port": 9001 },
+      "pos": { "port": 9002 },
+      "mobile": { "enabled": true }
+    },
+    "local_log_retention": 90,
+    "reporting_threshold": 10000
+  }
+}

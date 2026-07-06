@@ -1,0 +1,524 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Edge Gateway — Open-source privacy gateway for fraud signals</title>
+<meta name="description" content="Edge Gateway strips raw PII from bank transactions and forwards only pseudonymized fraud signals to the IntelFraud Hub. Apache-2.0, self-hostable, auditable.">
+<style>
+  *{margin:0;padding:0;box-sizing:border-box}
+  :root{
+    --emerald:#10b981;--emerald-dark:#059669;--emerald-light:#d1fae5;--emerald-glow:rgba(16,185,129,0.12);
+    --cyan:#06b6d4;
+    --slate-50:#f8fafc;--slate-100:#f1f5f9;--slate-200:#e2e8f0;--slate-300:#cbd5e1;
+    --slate-400:#94a3b8;--slate-500:#64748b;--slate-600:#475569;--slate-700:#334155;
+    --slate-800:#1e293b;--slate-900:#0f172a;--slate-950:#020617;
+    --amber:#f59e0b;--white:#fff;--radius:16px;--radius-sm:10px;
+    --sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    --mono:ui-monospace,"SF Mono","JetBrains Mono",Menlo,Consolas,monospace;
+  }
+  html{scroll-behavior:smooth}
+  body{font-family:var(--sans);color:var(--slate-800);background:var(--slate-50);overflow-x:hidden;line-height:1.6;-webkit-font-smoothing:antialiased}
+  .container{max-width:1180px;margin:0 auto;padding:0 24px}
+  a{text-decoration:none;color:inherit}
+  section{position:relative}
+  .sec-head{text-align:center;max-width:680px;margin:0 auto 56px}
+  .eyebrow{display:inline-block;font-size:.78rem;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:var(--emerald-dark);margin-bottom:14px}
+  .sec-title{font-size:clamp(1.9rem,4vw,2.6rem);font-weight:750;letter-spacing:-.025em;color:var(--slate-950);line-height:1.15}
+  .sec-sub{font-size:1.08rem;color:var(--slate-500);margin-top:16px}
+
+  /* NAV */
+  nav{position:fixed;top:0;left:0;right:0;z-index:100;padding:0 24px}
+  .nav-wrap{max-width:1180px;margin:16px auto 0;background:rgba(255,255,255,.85);backdrop-filter:blur(12px);border:1px solid var(--slate-200);border-radius:100px;padding:10px 10px 10px 22px;display:flex;align-items:center;justify-content:space-between;box-shadow:0 4px 24px rgba(0,0,0,.05)}
+  .nav-logo{display:flex;align-items:center;gap:10px;font-weight:750;font-size:1.05rem;color:var(--slate-900)}
+  .nav-logo-icon{width:32px;height:32px;background:var(--emerald);border-radius:9px;display:flex;align-items:center;justify-content:center}
+  .nav-links{display:flex;align-items:center;gap:4px;list-style:none}
+  .nav-links a{padding:8px 16px;font-size:.88rem;font-weight:550;color:var(--slate-600);border-radius:100px;transition:.2s}
+  .nav-links a:hover{color:var(--slate-900);background:var(--slate-100)}
+  .nav-links .btn-pill{background:var(--slate-900);color:#fff;padding:9px 18px;font-weight:600;display:flex;align-items:center;gap:7px}
+  .nav-links .btn-pill:hover{background:var(--slate-800)}
+  .mobile-btn{display:none;background:none;border:none;cursor:pointer;padding:8px}
+  .mobile-btn span{display:block;width:20px;height:2px;background:var(--slate-700);margin:4px 0;border-radius:2px}
+
+  /* HERO */
+  .hero{padding:170px 0 90px;overflow:hidden}
+  .hero-orb{position:absolute;border-radius:50%;filter:blur(90px);opacity:.5;animation:float 9s ease-in-out infinite;pointer-events:none}
+  .hero-orb-1{width:520px;height:520px;background:var(--emerald-light);top:-120px;right:-120px}
+  .hero-orb-2{width:420px;height:420px;background:#dbeafe;bottom:-100px;left:-100px;animation-delay:3s}
+  @keyframes float{0%,100%{transform:translateY(0)}50%{transform:translateY(-28px)}}
+  .hero-inner{position:relative;text-align:center;max-width:860px;margin:0 auto}
+  .chip{display:inline-flex;align-items:center;gap:9px;padding:6px 16px 6px 8px;border-radius:100px;background:#fff;border:1px solid var(--slate-200);font-size:.82rem;font-weight:600;color:var(--slate-600);margin-bottom:26px;box-shadow:0 1px 4px rgba(0,0,0,.04)}
+  .chip .tag{background:var(--emerald-light);color:var(--emerald-dark);font-weight:700;padding:2px 9px;border-radius:100px;font-size:.75rem}
+  .hero h1{font-size:clamp(2.7rem,6vw,4.3rem);font-weight:770;line-height:1.08;letter-spacing:-.035em;margin-bottom:22px;color:var(--slate-950)}
+  .hero h1 em{font-style:normal;background:linear-gradient(120deg,var(--emerald),var(--cyan));-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text}
+  .hero-p{font-size:1.22rem;color:var(--slate-500);max-width:640px;margin:0 auto 36px;line-height:1.65}
+  .hero-btns{display:flex;gap:12px;justify-content:center;flex-wrap:wrap;margin-bottom:26px}
+  .btn{display:inline-flex;align-items:center;gap:9px;padding:13px 26px;border-radius:100px;font-weight:600;font-size:.96rem;transition:.25s;border:none;cursor:pointer;font-family:inherit}
+  .btn svg{width:18px;height:18px}
+  .btn-dark{background:var(--slate-900);color:#fff;box-shadow:0 2px 14px rgba(15,23,42,.2)}
+  .btn-dark:hover{background:var(--slate-800);transform:translateY(-2px);box-shadow:0 8px 24px rgba(15,23,42,.26)}
+  .btn-light{background:#fff;color:var(--slate-700);border:1.5px solid var(--slate-200)}
+  .btn-light:hover{border-color:var(--slate-400);background:var(--slate-50)}
+  .btn-emerald{background:var(--emerald);color:#fff;box-shadow:0 2px 14px var(--emerald-glow)}
+  .btn-emerald:hover{background:var(--emerald-dark);transform:translateY(-2px)}
+  .hero-clone{display:inline-flex;align-items:center;gap:12px;font-family:var(--mono);font-size:.85rem;color:var(--slate-500);background:var(--white);border:1px solid var(--slate-200);border-radius:100px;padding:9px 10px 9px 18px}
+  .hero-clone .dollar{color:var(--emerald)}
+  .hero-clone code{color:var(--slate-700)}
+  .copy-btn{background:var(--slate-100);border:none;border-radius:100px;padding:5px 12px;font-size:.75rem;font-weight:600;color:var(--slate-600);cursor:pointer;font-family:var(--sans)}
+  .copy-btn:hover{background:var(--slate-200)}
+
+  /* TICKER */
+  .ticker{padding:44px 0;border-top:1px solid var(--slate-200);border-bottom:1px solid var(--slate-200);background:#fff}
+  .ticker-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:24px}
+  .ticker-item{text-align:center}
+  .ticker-item .k{font-size:1.6rem;font-weight:770;color:var(--slate-900);letter-spacing:-.02em}
+  .ticker-item .k em{font-style:normal;color:var(--emerald-dark)}
+  .ticker-item .l{font-size:.82rem;color:var(--slate-500);margin-top:4px;font-weight:500}
+
+  /* ARCHITECTURE */
+  .arch-section{padding:96px 0}
+  .arch-wrap{background:var(--slate-950);border-radius:24px;padding:40px 32px;box-shadow:0 30px 60px -20px rgba(2,6,23,.4)}
+  .arch-wrap svg{width:100%;height:auto;display:block}
+  .arch-legend{display:flex;gap:26px;justify-content:center;flex-wrap:wrap;margin-top:26px}
+  .arch-legend span{display:flex;align-items:center;gap:8px;font-size:.84rem;color:var(--slate-300);font-weight:500}
+  .arch-legend i{width:22px;height:0;border-top-width:3px;border-top-style:solid;display:inline-block;border-radius:2px}
+
+  /* PIPELINE */
+  .pipe-section{padding:96px 0;background:#fff;border-top:1px solid var(--slate-200);border-bottom:1px solid var(--slate-200)}
+  .pipe-grid{display:grid;grid-template-columns:1fr auto 1fr;gap:28px;align-items:center}
+  .code-card{background:var(--slate-950);border-radius:var(--radius);padding:22px 24px;font-family:var(--mono);font-size:.82rem;line-height:1.85;overflow-x:auto;box-shadow:0 20px 40px -18px rgba(2,6,23,.45)}
+  .code-card .cc-head{display:flex;gap:6px;margin-bottom:14px}
+  .code-card .cc-head i{width:11px;height:11px;border-radius:50%;background:var(--slate-700)}
+  .code-card pre{color:var(--slate-300);white-space:pre;margin:0}
+  .tok-key{color:#7dd3fc}.tok-str{color:#86efac}.tok-num{color:#fca5a5}.tok-mut{color:var(--slate-500)}.tok-del{color:#fca5a5;text-decoration:line-through;opacity:.6}
+  .pipe-arrow{display:flex;flex-direction:column;align-items:center;gap:8px;color:var(--emerald)}
+  .pipe-arrow svg{width:40px;height:40px}
+  .pipe-arrow span{font-size:.72rem;font-weight:700;letter-spacing:.06em;text-transform:uppercase;color:var(--slate-400)}
+
+  /* BENTO FEATURES */
+  .bento-section{padding:96px 0}
+  .bento{display:grid;grid-template-columns:repeat(3,1fr);gap:18px}
+  .b-card{background:#fff;border:1px solid var(--slate-200);border-radius:var(--radius);padding:26px;transition:.25s}
+  .b-card:hover{border-color:var(--emerald);box-shadow:0 12px 30px -12px var(--emerald-glow);transform:translateY(-3px)}
+  .b-icon{width:44px;height:44px;border-radius:11px;background:var(--emerald-light);display:flex;align-items:center;justify-content:center;margin-bottom:16px;font-size:1.35rem}
+  .b-card h3{font-size:1.12rem;font-weight:700;color:var(--slate-900);margin-bottom:8px;letter-spacing:-.01em}
+  .b-card p{font-size:.94rem;color:var(--slate-500)}
+  .b-card code{font-family:var(--mono);font-size:.85em;background:var(--slate-100);padding:1px 6px;border-radius:5px;color:var(--slate-700)}
+  .b-wide{grid-column:span 2}
+
+  /* OPEN SOURCE */
+  .os-section{padding:96px 0;background:var(--slate-950);color:#fff}
+  .os-section .eyebrow{color:var(--emerald)}
+  .os-section .sec-title{color:#fff}
+  .os-section .sec-sub{color:var(--slate-400)}
+  .os-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:18px;margin-top:8px}
+  .os-card{background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.09);border-radius:var(--radius);padding:28px}
+  .os-card h3{font-size:1.15rem;font-weight:700;margin-bottom:10px;display:flex;align-items:center;gap:10px}
+  .os-card h3 .badge{font-family:var(--mono);font-size:.7rem;font-weight:600;background:var(--emerald);color:#04110b;padding:3px 8px;border-radius:6px;letter-spacing:.02em}
+  .os-card p{color:var(--slate-400);font-size:.95rem}
+  .os-card a.inline{color:var(--emerald);font-weight:600}
+  .os-card a.inline:hover{text-decoration:underline}
+  .os-note{margin-top:28px;padding:20px 24px;background:rgba(245,158,11,.08);border:1px solid rgba(245,158,11,.25);border-radius:var(--radius);color:var(--slate-300);font-size:.94rem;display:flex;gap:14px;align-items:flex-start}
+  .os-note b{color:#fcd34d}
+
+  /* USE CASES */
+  .uc-section{padding:96px 0}
+  .uc-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:18px}
+  .uc-card{background:#fff;border:1px solid var(--slate-200);border-radius:var(--radius);padding:26px}
+  .uc-card:hover{border-color:var(--slate-300);box-shadow:0 10px 26px -14px rgba(2,6,23,.12)}
+  .uc-tag{font-family:var(--mono);font-size:.72rem;font-weight:600;color:var(--emerald-dark);background:var(--emerald-light);padding:3px 9px;border-radius:6px;display:inline-block;margin-bottom:14px}
+  .uc-card h3{font-size:1.08rem;font-weight:700;color:var(--slate-900);margin-bottom:8px}
+  .uc-card p{font-size:.93rem;color:var(--slate-500)}
+
+  /* GET STARTED */
+  .gs-section{padding:96px 0;background:#fff;border-top:1px solid var(--slate-200)}
+  .gs-grid{display:grid;grid-template-columns:.9fr 1.1fr;gap:48px;align-items:center}
+  .step-row{display:flex;gap:16px;margin-bottom:24px}
+  .step-num{flex:none;width:34px;height:34px;border-radius:10px;background:var(--slate-900);color:#fff;display:flex;align-items:center;justify-content:center;font-weight:700;font-size:.9rem}
+  .step-row h4{font-size:1.05rem;font-weight:700;color:var(--slate-900);margin-bottom:4px}
+  .step-row p{font-size:.93rem;color:var(--slate-500)}
+  .step-row code{font-family:var(--mono);font-size:.85em;background:var(--slate-100);padding:1px 6px;border-radius:5px;color:var(--slate-700)}
+
+  /* CTA */
+  .cta-section{padding:100px 0}
+  .cta-box{background:linear-gradient(135deg,var(--slate-900),var(--slate-950));border-radius:28px;padding:64px 40px;text-align:center;position:relative;overflow:hidden}
+  .cta-box::before{content:"";position:absolute;width:400px;height:400px;background:var(--emerald-glow);border-radius:50%;filter:blur(80px);top:-150px;right:-80px}
+  .cta-box h2{font-size:clamp(1.9rem,4vw,2.7rem);font-weight:770;color:#fff;letter-spacing:-.025em;margin-bottom:16px;position:relative}
+  .cta-box p{color:var(--slate-400);font-size:1.1rem;max-width:520px;margin:0 auto 32px;position:relative}
+  .cta-box .hero-btns{margin-bottom:0;position:relative}
+
+  /* FOOTER */
+  footer{padding:56px 0 40px;border-top:1px solid var(--slate-200)}
+  .foot-grid{display:flex;justify-content:space-between;flex-wrap:wrap;gap:32px;margin-bottom:36px}
+  .foot-brand{max-width:320px}
+  .foot-brand .nav-logo{margin-bottom:14px}
+  .foot-brand p{font-size:.9rem;color:var(--slate-500)}
+  .foot-cols{display:flex;gap:56px;flex-wrap:wrap}
+  .foot-col h5{font-size:.78rem;font-weight:700;letter-spacing:.06em;text-transform:uppercase;color:var(--slate-400);margin-bottom:14px}
+  .foot-col a{display:block;font-size:.9rem;color:var(--slate-600);margin-bottom:9px}
+  .foot-col a:hover{color:var(--emerald-dark)}
+  .foot-bottom{border-top:1px solid var(--slate-200);padding-top:24px;display:flex;justify-content:space-between;flex-wrap:wrap;gap:12px;font-size:.84rem;color:var(--slate-400)}
+  .foot-bottom a{color:var(--slate-500);font-weight:600}
+
+  @media(max-width:860px){
+    .nav-links li:not(.nav-cta){display:none}
+    .ticker-grid{grid-template-columns:repeat(2,1fr);gap:32px 16px}
+    .pipe-grid{grid-template-columns:1fr;gap:16px}
+    .pipe-arrow{transform:rotate(90deg)}
+    .bento,.uc-grid,.os-grid{grid-template-columns:1fr}
+    .b-wide{grid-column:span 1}
+    .gs-grid{grid-template-columns:1fr;gap:32px}
+    .foot-grid{flex-direction:column}
+  }
+</style>
+</head>
+<body>
+
+<!-- NAV -->
+<nav>
+  <div class="nav-wrap">
+    <a href="#" class="nav-logo">
+      <span class="nav-logo-icon">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none"><path d="M12 2 4 6v6c0 5 3.5 8 8 10 4.5-2 8-5 8-10V6l-8-4Z" fill="#fff"/><path d="M9 12l2 2 4-4" stroke="#10b981" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      </span>
+      Edge Gateway
+    </a>
+    <ul class="nav-links">
+      <li><a href="#architecture">Architecture</a></li>
+      <li><a href="#features">Features</a></li>
+      <li><a href="#open-source">Open Source</a></li>
+      <li><a href="#start">Get Started</a></li>
+      <li class="nav-cta"><a href="https://github.com/papoveB01/EdgeGW_Project" class="btn-pill">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M12 2C6.48 2 2 6.58 2 12.25c0 4.53 2.87 8.37 6.84 9.73.5.09.68-.22.68-.49v-1.7c-2.78.62-3.37-1.37-3.37-1.37-.45-1.18-1.11-1.49-1.11-1.49-.91-.63.07-.62.07-.62 1 .07 1.53 1.06 1.53 1.06.9 1.57 2.36 1.12 2.93.85.09-.66.35-1.12.63-1.37-2.22-.26-4.55-1.14-4.55-5.05 0-1.12.39-2.03 1.03-2.75-.1-.26-.45-1.3.1-2.7 0 0 .84-.28 2.75 1.05a9.36 9.36 0 0 1 5 0c1.91-1.33 2.75-1.05 2.75-1.05.55 1.4.2 2.44.1 2.7.64.72 1.03 1.63 1.03 2.75 0 3.92-2.34 4.78-4.57 5.03.36.32.68.94.68 1.9v2.82c0 .27.18.59.69.49A10.26 10.26 0 0 0 22 12.25C22 6.58 17.52 2 12 2Z"/></svg>
+        GitHub</a></li>
+    </ul>
+  </div>
+</nav>
+
+<!-- HERO -->
+<section class="hero">
+  <div class="hero-orb hero-orb-1"></div>
+  <div class="hero-orb hero-orb-2"></div>
+  <div class="container hero-inner">
+    <div class="chip"><span class="tag">Apache-2.0</span> Open source · self-hostable · auditable</div>
+    <h1>Your data stays home.<br>Only <em>intelligence</em> travels.</h1>
+    <p class="hero-p">Edge Gateway runs inside your bank, strips raw PII from every transaction, and forwards only pseudonymized fraud signals to the IntelFraud Hub for cross-institutional detection. No raw PII ever leaves your network.</p>
+    <div class="hero-btns">
+      <a href="https://github.com/papoveB01/EdgeGW_Project" class="btn btn-dark">
+        <svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 2C6.48 2 2 6.58 2 12.25c0 4.53 2.87 8.37 6.84 9.73.5.09.68-.22.68-.49v-1.7c-2.78.62-3.37-1.37-3.37-1.37-.45-1.18-1.11-1.49-1.11-1.49-.91-.63.07-.62.07-.62 1 .07 1.53 1.06 1.53 1.06.9 1.57 2.36 1.12 2.93.85.09-.66.35-1.12.63-1.37-2.22-.26-4.55-1.14-4.55-5.05 0-1.12.39-2.03 1.03-2.75-.1-.26-.45-1.3.1-2.7 0 0 .84-.28 2.75 1.05a9.36 9.36 0 0 1 5 0c1.91-1.33 2.75-1.05 2.75-1.05.55 1.4.2 2.44.1 2.7.64.72 1.03 1.63 1.03 2.75 0 3.92-2.34 4.78-4.57 5.03.36.32.68.94.68 1.9v2.82c0 .27.18.59.69.49A10.26 10.26 0 0 0 22 12.25C22 6.58 17.52 2 12 2Z"/></svg>
+        View on GitHub</a>
+      <a href="#architecture" class="btn btn-light">See how it works</a>
+    </div>
+    <div class="hero-clone"><span class="dollar">$</span> <code>git clone github.com/papoveB01/EdgeGW_Project</code>
+      <button class="copy-btn" onclick="navigator.clipboard&&navigator.clipboard.writeText('git clone https://github.com/papoveB01/EdgeGW_Project.git');this.textContent='Copied'">Copy</button>
+    </div>
+  </div>
+</section>
+
+<!-- TICKER -->
+<div class="ticker">
+  <div class="container">
+    <div class="ticker-grid">
+      <div class="ticker-item"><div class="k"><em>Zero</em></div><div class="l">raw PII on the wire</div></div>
+      <div class="ticker-item"><div class="k">HMAC-<em>SHA256</em></div><div class="l">signed, keyed pseudonyms</div></div>
+      <div class="ticker-item"><div class="k"><em>202</em> Accepted</div><div class="l">durable, outage-proof delivery</div></div>
+      <div class="ticker-item"><div class="k">1 <em>binary</em></div><div class="l">distroless, nonroot, no deps</div></div>
+    </div>
+  </div>
+</div>
+
+<!-- ARCHITECTURE -->
+<section id="architecture" class="arch-section">
+  <div class="container">
+    <div class="sec-head">
+      <span class="eyebrow">Architecture</span>
+      <h2 class="sec-title">PII stays inside the bank. Signals cross the boundary.</h2>
+      <p class="sec-sub">A single container in your private network is the only thing that touches raw customer data. Everything downstream sees pseudonyms.</p>
+    </div>
+    <div class="arch-wrap">
+      <svg viewBox="0 0 1000 380" xmlns="http://www.w3.org/2000/svg" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,sans-serif">
+        <!-- zones -->
+        <rect x="20" y="40" width="470" height="300" rx="16" fill="#0b1220" stroke="#1e293b" stroke-width="1.5"/>
+        <rect x="560" y="40" width="420" height="300" rx="16" fill="#0b1220" stroke="#1e293b" stroke-width="1.5"/>
+        <text x="44" y="70" fill="#64748b" font-size="13" font-weight="700" letter-spacing="1">YOUR INFRASTRUCTURE — PII NEVER LEAVES</text>
+        <text x="584" y="70" fill="#64748b" font-size="13" font-weight="700" letter-spacing="1">INTELFRAUD HUB &amp; EXTERNAL SYSTEMS</text>
+
+        <!-- bank core nodes -->
+        <g>
+          <rect x="52" y="100" width="150" height="46" rx="10" fill="#111c30" stroke="#334155"/><text x="127" y="128" fill="#cbd5e1" font-size="13" text-anchor="middle">Core Banking</text>
+          <rect x="52" y="164" width="150" height="46" rx="10" fill="#111c30" stroke="#334155"/><text x="127" y="192" fill="#cbd5e1" font-size="13" text-anchor="middle">ATM / POS</text>
+          <rect x="52" y="228" width="150" height="46" rx="10" fill="#111c30" stroke="#334155"/><text x="127" y="256" fill="#cbd5e1" font-size="13" text-anchor="middle">Mobile / Web</text>
+        </g>
+
+        <!-- gateway -->
+        <rect x="300" y="150" width="150" height="120" rx="14" fill="url(#gw)" stroke="#10b981" stroke-width="1.5"/>
+        <text x="375" y="197" fill="#fff" font-size="15" font-weight="700" text-anchor="middle">Edge</text>
+        <text x="375" y="217" fill="#fff" font-size="15" font-weight="700" text-anchor="middle">Gateway</text>
+        <text x="375" y="240" fill="#a7f3d0" font-size="11" text-anchor="middle">anonymize · sign</text>
+        <defs>
+          <linearGradient id="gw" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#065f46"/><stop offset="1" stop-color="#0e7490"/></linearGradient>
+          <marker id="ar" markerWidth="9" markerHeight="9" refX="6" refY="3" orient="auto"><path d="M0 0l6 3-6 3z" fill="#ef4444"/></marker>
+          <marker id="ag" markerWidth="9" markerHeight="9" refX="6" refY="3" orient="auto"><path d="M0 0l6 3-6 3z" fill="#10b981"/></marker>
+        </defs>
+
+        <!-- raw PII arrows -->
+        <path d="M202 123 H255 Q272 123 272 150 V196 H298" fill="none" stroke="#ef4444" stroke-width="2" marker-end="url(#ar)"/>
+        <path d="M202 187 H298" fill="none" stroke="#ef4444" stroke-width="2" marker-end="url(#ar)"/>
+        <path d="M202 251 H255 Q272 251 272 224 V210 H298" fill="none" stroke="#ef4444" stroke-width="2" marker-end="url(#ar)"/>
+        <text x="250" y="112" fill="#f87171" font-size="11" text-anchor="middle">raw PII</text>
+
+        <!-- anonymized arrow -->
+        <path d="M450 210 H505 Q525 210 525 190 V150 H700" fill="none" stroke="#10b981" stroke-width="2.5" marker-end="url(#ag)"/>
+        <text x="590" y="140" fill="#34d399" font-size="11" text-anchor="middle">pseudonymized signal (HMAC-signed)</text>
+
+        <!-- hub nodes -->
+        <rect x="610" y="120" width="150" height="42" rx="10" fill="#062e26" stroke="#10b981"/><text x="685" y="146" fill="#a7f3d0" font-size="12.5" text-anchor="middle">IntelFraud Hub</text>
+        <rect x="800" y="120" width="150" height="42" rx="10" fill="#111c30" stroke="#334155"/><text x="875" y="146" fill="#cbd5e1" font-size="12.5" text-anchor="middle">Fraud / AML</text>
+        <rect x="610" y="196" width="150" height="42" rx="10" fill="#111c30" stroke="#334155"/><text x="685" y="222" fill="#cbd5e1" font-size="12.5" text-anchor="middle">ML training</text>
+        <rect x="800" y="196" width="150" height="42" rx="10" fill="#111c30" stroke="#334155"/><text x="875" y="222" fill="#cbd5e1" font-size="12.5" text-anchor="middle">SIEM / SOC</text>
+        <path d="M760 141 H798" fill="none" stroke="#334155" stroke-width="1.5"/>
+        <path d="M685 162 V196" fill="none" stroke="#334155" stroke-width="1.5"/>
+        <path d="M685 217 H800" fill="none" stroke="#334155" stroke-width="1.5"/>
+
+        <!-- durable spool note -->
+        <rect x="300" y="290" width="150" height="34" rx="9" fill="#111c30" stroke="#f59e0b" stroke-dasharray="4 3"/><text x="375" y="312" fill="#fcd34d" font-size="11" text-anchor="middle">durable spool</text>
+        <path d="M375 270 V290" fill="none" stroke="#f59e0b" stroke-width="1.5" stroke-dasharray="4 3"/>
+      </svg>
+      <div class="arch-legend">
+        <span><i style="border-color:#ef4444"></i> Raw PII — stays inside your network</span>
+        <span><i style="border-color:#10b981"></i> Pseudonymized signal — HMAC-signed</span>
+        <span><i style="border-color:#f59e0b"></i> Durable spool — survives Hub outages</span>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- PIPELINE -->
+<section class="pipe-section">
+  <div class="container">
+    <div class="sec-head">
+      <span class="eyebrow">Transformation</span>
+      <h2 class="sec-title">PII in, pseudonymized signal out</h2>
+      <p class="sec-sub">Deterministic, keyed transforms. Identity becomes a mosaic; amount becomes a tier; location becomes a zone; time becomes a bucket.</p>
+    </div>
+    <div class="pipe-grid">
+      <div class="code-card">
+        <div class="cc-head"><i></i><i></i><i></i></div>
+<pre><span class="tok-mut">// raw transaction (in the bank)</span>
+{
+  <span class="tok-key">"national_id"</span>: <span class="tok-str">"22345678901"</span>,
+  <span class="tok-key">"name"</span>: <span class="tok-str">"John Doe"</span>,
+  <span class="tok-key">"account"</span>: <span class="tok-str">"ACC-1234567890"</span>,
+  <span class="tok-key">"amount"</span>: <span class="tok-num">9500.00</span>,
+  <span class="tok-key">"latitude"</span>: <span class="tok-num">6.4541</span>,
+  <span class="tok-key">"longitude"</span>: <span class="tok-num">3.3947</span>,
+  <span class="tok-key">"timestamp"</span>: <span class="tok-str">"2026-01-15T14:07:33Z"</span>
+}</pre>
+      </div>
+      <div class="pipe-arrow">
+        <span>anonymize</span>
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14M13 6l6 6-6 6"/></svg>
+        <span>+ sign</span>
+      </div>
+      <div class="code-card">
+        <div class="cc-head"><i></i><i></i><i></i></div>
+<pre><span class="tok-mut">// signal sent to the Hub</span>
+{
+  <span class="tok-key">"identity_mosaic"</span>: <span class="tok-str">"d433f5d2…"</span>,
+  <span class="tok-key">"mosaic_scope"</span>: <span class="tok-str">"global"</span>,
+  <span class="tok-key">"mosaic_version"</span>: <span class="tok-num">2</span>,
+  <span class="tok-key">"timestamp"</span>: <span class="tok-str">"2026-01-15T14:00:00Z"</span>,
+  <span class="tok-key">"metadata"</span>: {
+    <span class="tok-key">"amount_tier"</span>: <span class="tok-str">"TIER_3"</span>,
+    <span class="tok-key">"location_zone"</span>: <span class="tok-str">"s14kt"</span>,
+    <span class="tok-key">"is_near_threshold"</span>: <span class="tok-num">true</span>
+  }
+}</pre>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- FEATURES -->
+<section id="features" class="bento-section">
+  <div class="container">
+    <div class="sec-head">
+      <span class="eyebrow">Capabilities</span>
+      <h2 class="sec-title">Built for cross-bank detection, without the exposure</h2>
+    </div>
+    <div class="bento">
+      <div class="b-card b-wide">
+        <div class="b-icon">🔗</div>
+        <h3>Cross-bank identity mosaics (v2)</h3>
+        <p>With a national identifier, the identity mosaic is an <code>HMAC-SHA256</code> keyed only by the shared regional pepper — so the same person yields the same mosaic at every member bank, enabling cross-institutional pattern detection. Without one, it falls back to a bank-local mosaic. Every signal is tagged <code>global</code> or <code>local</code> so the Hub knows what it may correlate.</p>
+      </div>
+      <div class="b-card">
+        <div class="b-icon">💾</div>
+        <h3>Durable spool</h3>
+        <p>Signals are persisted before acknowledgment and delivered by a background forwarder. Hub outages and restarts don't lose data — permanently rejected signals dead-letter instead of blocking the queue.</p>
+      </div>
+      <div class="b-card">
+        <div class="b-icon">🎭</div>
+        <h3>Privacy-preserving transforms</h3>
+        <p>Amount → tier, lat/long → geohash zone, timestamp → 15-minute UTC bucket, account / device / IP → salted hashes. Enough signal to detect fraud, not enough to re-identify.</p>
+      </div>
+      <div class="b-card">
+        <div class="b-icon">🕵️</div>
+        <h3>Structuring &amp; mule-route flags</h3>
+        <p>Near-threshold amounts are flagged for multi-bank structuring; a counterparty's destination mosaic matches their own identity mosaic, so the Hub can follow mule routes across institutions.</p>
+      </div>
+      <div class="b-card">
+        <div class="b-icon">🔐</div>
+        <h3>Signed &amp; authenticated</h3>
+        <p>HMAC-SHA256 payload signing to the Hub, inbound API-key auth on <code>/process</code>, optional TLS, a 1&nbsp;MB body cap, and PII-free structured logs.</p>
+      </div>
+      <div class="b-card">
+        <div class="b-icon">📦</div>
+        <h3>One hardened binary</h3>
+        <p>Distroless, nonroot, no shell — a single static Go binary with no runtime dependencies. Graceful shutdown, bounded retry with backoff, and a self-probing health check.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- OPEN SOURCE -->
+<section id="open-source" class="os-section">
+  <div class="container">
+    <div class="sec-head">
+      <span class="eyebrow">Open source, with a clear line of ownership</span>
+      <h2 class="sec-title">Open the client. Trust is the point.</h2>
+      <p class="sec-sub">The gateway handles your customers' PII — so you should be able to read every line before you run it. It's Apache-2.0 and open to contributions.</p>
+    </div>
+    <div class="os-grid">
+      <div class="os-card">
+        <h3>Apache-2.0 licensed <span class="badge">LICENSE</span></h3>
+        <p>Use it, modify it, self-host it, fork it. A permissive license with an explicit patent grant that enterprise and bank security teams already approve. <a class="inline" href="https://github.com/papoveB01/EdgeGW_Project/blob/main/LICENSE">Read the license →</a></p>
+      </div>
+      <div class="os-card">
+        <h3>Contributions welcome <span class="badge">DCO</span></h3>
+        <p>Fixes, tests, and docs are all welcome. We use a lightweight Developer Certificate of Origin — sign off your commits with <code style="font-family:var(--mono)">git commit -s</code>; no CLA, you keep your copyright. <a class="inline" href="https://github.com/papoveB01/EdgeGW_Project/blob/main/CONTRIBUTING.md">Contributing guide →</a></p>
+      </div>
+      <div class="os-card">
+        <h3>Open client, proprietary core</h3>
+        <p>This gateway is the open, self-hostable client. The IntelFraud Hub — the cross-institutional network it feeds — is a separate, proprietary service. The code is yours to audit; the network is the product.</p>
+      </div>
+      <div class="os-card">
+        <h3>Auditable by design</h3>
+        <p>Every transformation is deterministic and covered by tests. Your compliance and security teams can verify exactly what leaves your network — and prove no raw PII does. <a class="inline" href="https://github.com/papoveB01/EdgeGW_Project/blob/main/SECURITY.md">Security policy →</a></p>
+      </div>
+    </div>
+    <div class="os-note">
+      <span style="font-size:1.2rem">⚖️</span>
+      <div><b>Ownership is retained where it matters.</b> "IntelFraud" and "Edge Gateway" are trademarks; the name and brand stay ours even though the code is open. See <a class="inline" href="https://github.com/papoveB01/EdgeGW_Project/blob/main/TRADEMARKS.md">TRADEMARKS.md</a> — fork the code freely, just ship it under your own name.</div>
+    </div>
+  </div>
+</section>
+
+<!-- USE CASES -->
+<section class="uc-section">
+  <div class="container">
+    <div class="sec-head">
+      <span class="eyebrow">Use cases</span>
+      <h2 class="sec-title">One gateway, many detections</h2>
+    </div>
+    <div class="uc-grid">
+      <div class="uc-card"><span class="uc-tag">cross-bank</span><h3>Consortium fraud intelligence</h3><p>Match the same fraudster across member banks by global identity mosaic — without any institution exposing customer identities to another.</p></div>
+      <div class="uc-card"><span class="uc-tag">AML</span><h3>Structuring detection</h3><p>Near-threshold flags surface deposits split across institutions to stay under reporting limits — the classic smurfing pattern.</p></div>
+      <div class="uc-card"><span class="uc-tag">graph</span><h3>Mule-route tracing</h3><p>Destination mosaics let the Hub follow funds hop-to-hop across banks and reconstruct money-mule networks.</p></div>
+      <div class="uc-card"><span class="uc-tag">ML</span><h3>Privacy-safe model training</h3><p>Feed pseudonymized, tiered features to fraud models and shared datasets without moving a single PII field.</p></div>
+      <div class="uc-card"><span class="uc-tag">residency</span><h3>Data-residency compliance</h3><p>PII stays in-jurisdiction by architecture, not policy — helping meet GDPR / NDPA and local data-residency rules.</p></div>
+      <div class="uc-card"><span class="uc-tag">ops</span><h3>Resilient signal delivery</h3><p>The durable spool keeps collecting signals through Hub maintenance windows and network blips, then replays them in order.</p></div>
+    </div>
+  </div>
+</section>
+
+<!-- GET STARTED -->
+<section id="start" class="gs-section">
+  <div class="container">
+    <div class="gs-grid">
+      <div>
+        <span class="eyebrow">Get started</span>
+        <h2 class="sec-title" style="text-align:left;margin-bottom:28px">Running in minutes, not months</h2>
+        <div class="step-row"><div class="step-num">1</div><div><h4>Clone &amp; configure</h4><p>Copy <code>.env.example</code> and set your <code>BANK_SALT</code>, <code>REGIONAL_PEPPER</code>, Hub credentials, and <code>HMAC_SECRET</code>.</p></div></div>
+        <div class="step-row"><div class="step-num">2</div><div><h4>Deploy the container</h4><p>Run the distroless image inside your private network. Set <code>INBOUND_API_KEY</code> and TLS, point <code>SPOOL_DIR</code> at a volume.</p></div></div>
+        <div class="step-row"><div class="step-num">3</div><div><h4>POST your transactions</h4><p>Send raw transactions to <code>/process</code>. The gateway anonymizes, signs, and forwards to the Hub — and returns <code>202</code>.</p></div></div>
+      </div>
+      <div class="code-card">
+        <div class="cc-head"><i></i><i></i><i></i></div>
+<pre><span class="tok-mut"># run the gateway</span>
+$ docker run -p 8080:8080 \
+    -e INSTITUTION_ID=<span class="tok-str">BNK_LAGOS</span> \
+    -e BANK_SALT=<span class="tok-str">$SALT</span> \
+    -e REGIONAL_PEPPER=<span class="tok-str">$PEPPER</span> \
+    -e HMAC_SECRET=<span class="tok-str">$SECRET</span> \
+    -e SPOOL_DIR=<span class="tok-str">/spool</span> \
+    edge-gateway
+
+<span class="tok-mut"># send a transaction</span>
+$ curl -X POST localhost:8080/process \
+    -H <span class="tok-str">"Authorization: Bearer $KEY"</span> \
+    -d <span class="tok-str">'{ "national_id":"2234…", "amount":9500, … }'</span>
+
+<span class="tok-key">{</span> <span class="tok-str">"status"</span>:<span class="tok-str">"queued"</span>, <span class="tok-str">"mosaic_scope"</span>:<span class="tok-str">"global"</span> <span class="tok-key">}</span></pre>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- CTA -->
+<section class="cta-section">
+  <div class="container">
+    <div class="cta-box">
+      <h2>Read the code. Run it. Contribute.</h2>
+      <p>Edge Gateway is open source and self-hostable. Star it, audit it, deploy it inside your bank, or open a pull request.</p>
+      <div class="hero-btns">
+        <a href="https://github.com/papoveB01/EdgeGW_Project" class="btn btn-emerald">
+          <svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 2C6.48 2 2 6.58 2 12.25c0 4.53 2.87 8.37 6.84 9.73.5.09.68-.22.68-.49v-1.7c-2.78.62-3.37-1.37-3.37-1.37-.45-1.18-1.11-1.49-1.11-1.49-.91-.63.07-.62.07-.62 1 .07 1.53 1.06 1.53 1.06.9 1.57 2.36 1.12 2.93.85.09-.66.35-1.12.63-1.37-2.22-.26-4.55-1.14-4.55-5.05 0-1.12.39-2.03 1.03-2.75-.1-.26-.45-1.3.1-2.7 0 0 .84-.28 2.75 1.05a9.36 9.36 0 0 1 5 0c1.91-1.33 2.75-1.05 2.75-1.05.55 1.4.2 2.44.1 2.7.64.72 1.03 1.63 1.03 2.75 0 3.92-2.34 4.78-4.57 5.03.36.32.68.94.68 1.9v2.82c0 .27.18.59.69.49A10.26 10.26 0 0 0 22 12.25C22 6.58 17.52 2 12 2Z"/></svg>
+          Star on GitHub</a>
+        <a href="https://github.com/papoveB01/EdgeGW_Project/blob/main/README.md" class="btn btn-light">Read the docs</a>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- FOOTER -->
+<footer>
+  <div class="container">
+    <div class="foot-grid">
+      <div class="foot-brand">
+        <div class="nav-logo"><span class="nav-logo-icon"><svg width="18" height="18" viewBox="0 0 24 24" fill="none"><path d="M12 2 4 6v6c0 5 3.5 8 8 10 4.5-2 8-5 8-10V6l-8-4Z" fill="#fff"/><path d="M9 12l2 2 4-4" stroke="#10b981" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>Edge Gateway</div>
+        <p>Privacy-preserving fraud signal gateway for financial institutions. Part of the IntelFraud platform.</p>
+      </div>
+      <div class="foot-cols">
+        <div class="foot-col">
+          <h5>Project</h5>
+          <a href="#architecture">Architecture</a>
+          <a href="#features">Features</a>
+          <a href="#open-source">Open Source</a>
+          <a href="#start">Get Started</a>
+        </div>
+        <div class="foot-col">
+          <h5>Repository</h5>
+          <a href="https://github.com/papoveB01/EdgeGW_Project">GitHub</a>
+          <a href="https://github.com/papoveB01/EdgeGW_Project/blob/main/README.md">Documentation</a>
+          <a href="https://github.com/papoveB01/EdgeGW_Project/blob/main/docs/signal-schema-v2.md">Signal schema v2</a>
+          <a href="https://github.com/papoveB01/EdgeGW_Project/issues">Issues</a>
+        </div>
+        <div class="foot-col">
+          <h5>Governance</h5>
+          <a href="https://github.com/papoveB01/EdgeGW_Project/blob/main/LICENSE">License (Apache-2.0)</a>
+          <a href="https://github.com/papoveB01/EdgeGW_Project/blob/main/CONTRIBUTING.md">Contributing</a>
+          <a href="https://github.com/papoveB01/EdgeGW_Project/blob/main/SECURITY.md">Security</a>
+          <a href="https://github.com/papoveB01/EdgeGW_Project/blob/main/TRADEMARKS.md">Trademarks</a>
+        </div>
+      </div>
+    </div>
+    <div class="foot-bottom">
+      <span>© 2026 IntelFraud. Code licensed under <a href="https://github.com/papoveB01/EdgeGW_Project/blob/main/LICENSE">Apache-2.0</a>.</span>
+      <span>"IntelFraud" and "Edge Gateway" are trademarks. The IntelFraud Hub is a separate proprietary service.</span>
+    </div>
+  </div>
+</footer>
+
+</body>
+</html>

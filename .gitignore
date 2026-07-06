@@ -4,6 +4,7 @@ coverage.html
 .env
 deployments/config/gateway.json
 /spool/
+/kys/
 *.exe
 *.dll
 *.so

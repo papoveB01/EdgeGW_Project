@@ -178,6 +178,28 @@ EdgeGW_Project/
   .github/workflows/    # CI pipeline
 ```
 
+## Contributing
+
+Edge Gateway is developed in the open and contributions are welcome. Please
+read [CONTRIBUTING.md](CONTRIBUTING.md) first — all commits must be signed off
+under the [Developer Certificate of Origin](DCO) (`git commit -s`). By
+contributing you agree your work is licensed to the project under Apache 2.0;
+you keep the copyright to your contribution.
+
+- Bugs and features: open a GitHub issue.
+- Security vulnerabilities: **do not** file a public issue — follow
+  [SECURITY.md](SECURITY.md).
+- Community standards: [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md).
+
 ## License
 
-Proprietary. Part of the IntelFraud platform.
+Copyright 2026 IntelFraud.
+
+The Edge Gateway source code is licensed under the **Apache License 2.0** — see
+[LICENSE](LICENSE) and [NOTICE](NOTICE). You may use, modify, and redistribute
+it under those terms.
+
+The name "IntelFraud", "Edge Gateway", and associated logos are trademarks and
+are **not** covered by the code license — see [TRADEMARKS.md](TRADEMARKS.md).
+The IntelFraud Hub service is a separate, proprietary component and is not part
+of this repository.

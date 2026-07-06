@@ -21,10 +21,14 @@ services:
       # ─── Optional ────────────────────────────────────────────────
       - GATEWAY_PORT=8080
       - REPORTING_THRESHOLD=${REPORTING_THRESHOLD:-10000}
+      - INBOUND_API_KEY=${INBOUND_API_KEY:-}
+      - TLS_CERT_FILE=${TLS_CERT_FILE:-}
+      - TLS_KEY_FILE=${TLS_KEY_FILE:-}
     volumes:
       - ./config:/config:ro
     healthcheck:
-      test: ["CMD-SHELL", "wget -q -O- --timeout=5 http://localhost:8080/health || exit 1"]
+      # Distroless image has no shell/wget — the binary probes itself.
+      test: ["CMD", "/edge-gateway", "-healthcheck"]
       interval: 20s
       timeout: 10s
       retries: 5

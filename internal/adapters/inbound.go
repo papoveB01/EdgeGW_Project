@@ -3,42 +3,28 @@ package adapters
 import (
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"time"
+
+	"github.com/papoveB01/EdgeGW_Project/internal/processor"
 )
 
 // ProcessInboundRequest handles incoming transaction data from Core Banking System.
-func ProcessInboundRequest(r *http.Request) (interface{}, error) {
-	body, err := io.ReadAll(r.Body)
-	if err != nil {
-		return nil, err
-	}
+// Decodes directly into RawData and validates field values (not just presence).
+func ProcessInboundRequest(r *http.Request) (*processor.RawData, error) {
 	defer r.Body.Close()
 
-	var rawData map[string]interface{}
-	if err := json.Unmarshal(body, &rawData); err != nil {
+	var rawData processor.RawData
+	dec := json.NewDecoder(r.Body)
+	if err := dec.Decode(&rawData); err != nil {
+		return nil, fmt.Errorf("invalid JSON: %w", err)
+	}
+
+	if err := rawData.Validate(); err != nil {
 		return nil, err
 	}
 
-	requiredFields := []string{"id", "name", "account", "amount", "latitude", "longitude", "timestamp"}
-	for _, field := range requiredFields {
-		if _, exists := rawData[field]; !exists {
-			return nil, &ValidationError{Field: field, Message: "required field missing"}
-		}
-	}
-
-	return rawData, nil
-}
-
-// ValidationError represents a validation error.
-type ValidationError struct {
-	Field   string
-	Message string
-}
-
-func (e *ValidationError) Error() string {
-	return fmt.Sprintf("validation error: %s - %s", e.Field, e.Message)
+	return &rawData, nil
 }
 
 // HealthCheckHandler returns gateway health status.

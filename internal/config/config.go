@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"os"
 	"strconv"
+	"sync"
 )
 
 // HubParams are provided by the Hub UI and identify the gateway to the Hub.
@@ -31,104 +32,118 @@ type GatewayConfig struct {
 	Local LocalParams `json:"local"`
 }
 
-var cached *GatewayConfig
+var (
+	mu     sync.Mutex
+	cached *GatewayConfig
+)
 
-// Load reads configuration from environment, then optionally from CONFIG_PATH file.
+// Load reads configuration. The config file (CONFIG_PATH) provides defaults;
+// environment variables take precedence over file values.
 func Load() *GatewayConfig {
+	mu.Lock()
+	defer mu.Unlock()
 	if cached != nil {
 		return cached
 	}
 	cfg := &GatewayConfig{
-		Hub: HubParams{
-			InstitutionID:  os.Getenv("INSTITUTION_ID"),
-			APIKey:         os.Getenv("API_KEY"),
-			HubEndpointURL: os.Getenv("HUB_API_URL"),
-		},
 		Local: LocalParams{
-			BankSalt:              os.Getenv("BANK_SALT"),
 			InternalAdapterConfig: make(InternalAdapterConfig),
-			LocalLogRetentionDays: envInt("LOCAL_LOG_RETENTION_DAYS", 90),
-			ReportingThreshold:    envFloat("REPORTING_THRESHOLD", 10000),
 		},
-	}
-	if cfg.Hub.HubEndpointURL == "" {
-		cfg.Hub.HubEndpointURL = "http://intel-api:8000/api/v1/signals"
-	}
-	if s := os.Getenv("INTERNAL_ADAPTER_CONFIG"); s != "" {
-		_ = json.Unmarshal([]byte(s), &cfg.Local.InternalAdapterConfig)
 	}
 
+	// 1. File provides defaults.
 	configPath := os.Getenv("CONFIG_PATH")
 	if configPath == "" {
 		configPath = "/config/gateway.json"
 	}
-	f, err := os.Open(configPath)
-	if err == nil {
-		defer f.Close()
+	if f, err := os.Open(configPath); err == nil {
 		fileCfg := &GatewayConfig{}
 		if err := json.NewDecoder(f).Decode(fileCfg); err == nil {
-			if fileCfg.Hub.InstitutionID != "" {
-				cfg.Hub.InstitutionID = fileCfg.Hub.InstitutionID
-			}
-			if fileCfg.Hub.APIKey != "" {
-				cfg.Hub.APIKey = fileCfg.Hub.APIKey
-			}
-			if fileCfg.Hub.HubEndpointURL != "" {
-				cfg.Hub.HubEndpointURL = fileCfg.Hub.HubEndpointURL
-			}
-			if fileCfg.Local.BankSalt != "" {
-				cfg.Local.BankSalt = fileCfg.Local.BankSalt
-			}
+			cfg.Hub = fileCfg.Hub
+			cfg.Local.BankSalt = fileCfg.Local.BankSalt
 			if len(fileCfg.Local.InternalAdapterConfig) > 0 {
 				cfg.Local.InternalAdapterConfig = fileCfg.Local.InternalAdapterConfig
 			}
-			if fileCfg.Local.LocalLogRetentionDays > 0 {
-				cfg.Local.LocalLogRetentionDays = fileCfg.Local.LocalLogRetentionDays
-			}
-			if fileCfg.Local.ReportingThreshold > 0 {
-				cfg.Local.ReportingThreshold = fileCfg.Local.ReportingThreshold
-			}
-			slog.Info("Loaded config overrides from file", "path", configPath)
+			cfg.Local.LocalLogRetentionDays = fileCfg.Local.LocalLogRetentionDays
+			cfg.Local.ReportingThreshold = fileCfg.Local.ReportingThreshold
+			slog.Info("Loaded config defaults from file", "path", configPath)
+		} else {
+			slog.Warn("Failed to parse config file, ignoring", "path", configPath, "error", err)
 		}
+		f.Close()
 	}
+
+	// 2. Environment variables override file values.
+	if v := os.Getenv("INSTITUTION_ID"); v != "" {
+		cfg.Hub.InstitutionID = v
+	}
+	if v := os.Getenv("API_KEY"); v != "" {
+		cfg.Hub.APIKey = v
+	}
+	if v := os.Getenv("HUB_API_URL"); v != "" {
+		cfg.Hub.HubEndpointURL = v
+	}
+	if v := os.Getenv("BANK_SALT"); v != "" {
+		cfg.Local.BankSalt = v
+	}
+	if s := os.Getenv("INTERNAL_ADAPTER_CONFIG"); s != "" {
+		_ = json.Unmarshal([]byte(s), &cfg.Local.InternalAdapterConfig)
+	}
+	if v, ok := envInt("LOCAL_LOG_RETENTION_DAYS"); ok {
+		cfg.Local.LocalLogRetentionDays = v
+	}
+	if v, ok := envFloat("REPORTING_THRESHOLD"); ok {
+		cfg.Local.ReportingThreshold = v
+	}
+
+	// 3. Built-in defaults for anything still unset.
+	if cfg.Hub.HubEndpointURL == "" {
+		cfg.Hub.HubEndpointURL = "http://intel-api:8000/api/v1/signals"
+	}
+	if cfg.Local.LocalLogRetentionDays <= 0 {
+		cfg.Local.LocalLogRetentionDays = 90
+	}
+	if cfg.Local.ReportingThreshold <= 0 {
+		cfg.Local.ReportingThreshold = 10000
+	}
+
 	cached = cfg
 	return cfg
 }
 
 // Reload forces a config reload from environment and file. Call on SIGHUP.
 func Reload() *GatewayConfig {
+	mu.Lock()
 	cached = nil
+	mu.Unlock()
 	return Load()
 }
 
-func envInt(key string, defaultVal int) int {
+func envInt(key string) (int, bool) {
 	s := os.Getenv(key)
 	if s == "" {
-		return defaultVal
+		return 0, false
 	}
 	v, err := strconv.Atoi(s)
 	if err != nil {
-		return defaultVal
+		return 0, false
 	}
-	return v
+	return v, true
 }
 
-func envFloat(key string, defaultVal float64) float64 {
+func envFloat(key string) (float64, bool) {
 	s := os.Getenv(key)
 	if s == "" {
-		return defaultVal
+		return 0, false
 	}
 	v, err := strconv.ParseFloat(s, 64)
 	if err != nil {
-		return defaultVal
+		return 0, false
 	}
-	return v
+	return v, true
 }
 
 // Get returns the current gateway config (loads if needed).
 func Get() *GatewayConfig {
-	if cached == nil {
-		return Load()
-	}
-	return cached
+	return Load()
 }

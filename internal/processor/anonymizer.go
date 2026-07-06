@@ -6,25 +6,69 @@ import (
 	"fmt"
 	"math"
 	"strings"
+	"time"
 )
 
 // RawData represents incoming transaction data with PII and optional fraud-detection fields.
+// Latitude/Longitude are optional (card-not-present and online transactions often
+// have no meaningful coordinates); absent location maps to ZONE_UNKNOWN.
 type RawData struct {
-	ID             string  `json:"id"`
-	Name           string  `json:"name"`
-	Account        string  `json:"account"`
-	Amount         float64 `json:"amount"`
-	Latitude       float64 `json:"latitude"`
-	Longitude      float64 `json:"longitude"`
-	Timestamp      string  `json:"timestamp"`
-	DeviceID       string  `json:"device_id,omitempty"`
-	DeviceIDHash   string  `json:"device_id_hash,omitempty"`
-	IP             string  `json:"ip,omitempty"`
-	IPHash         string  `json:"ip_hash,omitempty"`
-	BranchID       string  `json:"branch_id,omitempty"`
-	SignalType     string  `json:"signal_type,omitempty"`
-	EndpointType   string  `json:"endpoint_type,omitempty"`
-	CounterpartyID string  `json:"counterparty_id,omitempty"`
+	ID             string   `json:"id"`
+	Name           string   `json:"name"`
+	Account        string   `json:"account"`
+	Amount         float64  `json:"amount"`
+	Latitude       *float64 `json:"latitude,omitempty"`
+	Longitude      *float64 `json:"longitude,omitempty"`
+	Timestamp      string   `json:"timestamp"`
+	DeviceID       string   `json:"device_id,omitempty"`
+	DeviceIDHash   string   `json:"device_id_hash,omitempty"`
+	IP             string   `json:"ip,omitempty"`
+	IPHash         string   `json:"ip_hash,omitempty"`
+	BranchID       string   `json:"branch_id,omitempty"`
+	SignalType     string   `json:"signal_type,omitempty"`
+	EndpointType   string   `json:"endpoint_type,omitempty"`
+	CounterpartyID string   `json:"counterparty_id,omitempty"`
+}
+
+// Validate checks required fields hold usable values, not just that keys exist.
+func (r *RawData) Validate() error {
+	if strings.TrimSpace(r.ID) == "" {
+		return &ValidationError{Field: "id", Message: "must be a non-empty string"}
+	}
+	if strings.TrimSpace(r.Name) == "" {
+		return &ValidationError{Field: "name", Message: "must be a non-empty string"}
+	}
+	if strings.TrimSpace(r.Account) == "" {
+		return &ValidationError{Field: "account", Message: "must be a non-empty string"}
+	}
+	if r.Amount <= 0 || math.IsInf(r.Amount, 0) {
+		return &ValidationError{Field: "amount", Message: "must be a positive number"}
+	}
+	if _, err := time.Parse(time.RFC3339Nano, r.Timestamp); err != nil {
+		return &ValidationError{Field: "timestamp", Message: "must be RFC 3339 (e.g. 2026-01-15T14:07:33Z)"}
+	}
+	if (r.Latitude == nil) != (r.Longitude == nil) {
+		return &ValidationError{Field: "latitude/longitude", Message: "must be provided together or omitted together"}
+	}
+	if r.Latitude != nil {
+		if *r.Latitude < -90 || *r.Latitude > 90 || math.IsNaN(*r.Latitude) {
+			return &ValidationError{Field: "latitude", Message: "must be between -90 and 90"}
+		}
+		if *r.Longitude < -180 || *r.Longitude > 180 || math.IsNaN(*r.Longitude) {
+			return &ValidationError{Field: "longitude", Message: "must be between -180 and 180"}
+		}
+	}
+	return nil
+}
+
+// ValidationError represents a field validation failure.
+type ValidationError struct {
+	Field   string
+	Message string
+}
+
+func (e *ValidationError) Error() string {
+	return fmt.Sprintf("validation error: %s - %s", e.Field, e.Message)
 }
 
 // AnonymizedSignal represents the anonymized output — no PII.
@@ -62,8 +106,10 @@ const base32 = "0123456789bcdefghjkmnpqrstuvwxyz"
 
 // Geohash encodes lat/lon to a geohash string of the given precision.
 // Precision 5 gives ~4.9km x 4.9km grid cells — good for privacy-preserving location zones.
+// Out-of-range or NaN coordinates return ZONE_UNKNOWN.
 func Geohash(lat, lon float64, precision int) string {
-	if math.IsNaN(lat) || math.IsNaN(lon) || precision <= 0 {
+	if math.IsNaN(lat) || math.IsNaN(lon) || precision <= 0 ||
+		lat < -90 || lat > 90 || lon < -180 || lon > 180 {
 		return "ZONE_UNKNOWN"
 	}
 
@@ -106,22 +152,16 @@ func Geohash(lat, lon float64, precision int) string {
 	return hash.String()
 }
 
-// BucketTimestamp rounds a timestamp to 15-minute buckets for privacy.
-// Input: ISO 8601 timestamp string. Returns bucketed string or original if parsing fails.
+// BucketTimestamp rounds an RFC 3339 timestamp down to a 15-minute UTC bucket.
+// Timezone offsets are normalized to UTC so signals from different institutions
+// are comparable at the Hub. Unparseable input returns TIME_UNKNOWN — the raw
+// value is never passed through.
 func BucketTimestamp(ts string) string {
-	// Simple approach: truncate minutes to 15-min boundaries, zero seconds
-	// Works with format "2006-01-02T15:04:05..."
-	if len(ts) < 16 {
-		return ts
+	t, err := time.Parse(time.RFC3339Nano, ts)
+	if err != nil {
+		return "TIME_UNKNOWN"
 	}
-	// Parse minute
-	minStr := ts[14:16]
-	min := 0
-	for _, c := range minStr {
-		min = min*10 + int(c-'0')
-	}
-	bucketed := min - (min % 15)
-	return fmt.Sprintf("%s%02d:00", ts[:14], bucketed)
+	return t.UTC().Truncate(15 * time.Minute).Format(time.RFC3339)
 }
 
 // AnonymizeSignal processes raw PII data into an anonymized signal.
@@ -138,9 +178,12 @@ func AnonymizeSignal(rawPii RawData, institutionID string, salt string, pepper s
 	isNearThreshold := reportingThreshold > 0 && rawPii.Amount >= reportingThreshold*0.95
 
 	// 4. Real geohash for spatial grouping (precision 5 = ~4.9km cells)
-	zone := Geohash(rawPii.Latitude, rawPii.Longitude, 5)
+	zone := "ZONE_UNKNOWN"
+	if rawPii.Latitude != nil && rawPii.Longitude != nil {
+		zone = Geohash(*rawPii.Latitude, *rawPii.Longitude, 5)
+	}
 
-	// 5. Timestamp bucketing (15-minute windows)
+	// 5. Timestamp bucketing (15-minute windows, normalized to UTC)
 	bucketedTimestamp := BucketTimestamp(rawPii.Timestamp)
 
 	if institutionID == "" {

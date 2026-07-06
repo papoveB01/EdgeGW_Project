@@ -5,6 +5,8 @@ import (
 	"testing"
 )
 
+func f64(v float64) *float64 { return &v }
+
 func TestHash(t *testing.T) {
 	h := Hash("test")
 	if len(h) != 64 {
@@ -60,6 +62,14 @@ func TestGeohash(t *testing.T) {
 	if Geohash(nan, 10.0, 5) != "ZONE_UNKNOWN" {
 		t.Error("NaN latitude should return ZONE_UNKNOWN")
 	}
+
+	// Out-of-range coordinates return unknown
+	if Geohash(91, 10.0, 5) != "ZONE_UNKNOWN" {
+		t.Error("latitude > 90 should return ZONE_UNKNOWN")
+	}
+	if Geohash(45, 181, 5) != "ZONE_UNKNOWN" {
+		t.Error("longitude > 180 should return ZONE_UNKNOWN")
+	}
 }
 
 func TestBucketTimestamp(t *testing.T) {
@@ -67,12 +77,19 @@ func TestBucketTimestamp(t *testing.T) {
 		input string
 		want  string
 	}{
-		{"2026-01-15T14:07:33.123", "2026-01-15T14:00:00"},
-		{"2026-01-15T14:14:59.999", "2026-01-15T14:00:00"},
-		{"2026-01-15T14:15:00.000", "2026-01-15T14:15:00"},
-		{"2026-01-15T14:29:33.123", "2026-01-15T14:15:00"},
-		{"2026-01-15T14:44:33.123", "2026-01-15T14:30:00"},
-		{"2026-01-15T14:59:33.123", "2026-01-15T14:45:00"},
+		{"2026-01-15T14:07:33.123Z", "2026-01-15T14:00:00Z"},
+		{"2026-01-15T14:14:59.999Z", "2026-01-15T14:00:00Z"},
+		{"2026-01-15T14:15:00Z", "2026-01-15T14:15:00Z"},
+		{"2026-01-15T14:29:33.123Z", "2026-01-15T14:15:00Z"},
+		{"2026-01-15T14:44:33Z", "2026-01-15T14:30:00Z"},
+		{"2026-01-15T14:59:33Z", "2026-01-15T14:45:00Z"},
+		// Offsets are normalized to UTC so cross-institution timestamps compare
+		{"2026-01-15T15:07:33+01:00", "2026-01-15T14:00:00Z"},
+		{"2026-01-15T09:07:33-05:00", "2026-01-15T14:00:00Z"},
+		// Garbage never passes through raw
+		{"not-a-timestamp", "TIME_UNKNOWN"},
+		{"2026-01-15T14:07:33", "TIME_UNKNOWN"}, // missing offset — not RFC 3339
+		{"", "TIME_UNKNOWN"},
 	}
 	for _, tt := range tests {
 		got := BucketTimestamp(tt.input)
@@ -82,10 +99,49 @@ func TestBucketTimestamp(t *testing.T) {
 	}
 }
 
+func TestValidate(t *testing.T) {
+	valid := RawData{ID: "CUST-1", Name: "Test", Account: "ACC-1", Amount: 100,
+		Latitude: f64(6.45), Longitude: f64(3.39), Timestamp: "2026-01-15T14:07:33Z"}
+	if err := valid.Validate(); err != nil {
+		t.Fatalf("valid data rejected: %v", err)
+	}
+
+	// Location is optional when omitted together
+	noLoc := valid
+	noLoc.Latitude, noLoc.Longitude = nil, nil
+	if err := noLoc.Validate(); err != nil {
+		t.Errorf("missing location should be allowed: %v", err)
+	}
+
+	cases := []struct {
+		name   string
+		mutate func(*RawData)
+	}{
+		{"empty id", func(r *RawData) { r.ID = "" }},
+		{"whitespace id", func(r *RawData) { r.ID = "   " }},
+		{"empty name", func(r *RawData) { r.Name = "" }},
+		{"empty account", func(r *RawData) { r.Account = "" }},
+		{"zero amount", func(r *RawData) { r.Amount = 0 }},
+		{"negative amount", func(r *RawData) { r.Amount = -50 }},
+		{"bad timestamp", func(r *RawData) { r.Timestamp = "yesterday" }},
+		{"no-offset timestamp", func(r *RawData) { r.Timestamp = "2026-01-15T14:07:33" }},
+		{"lat without lon", func(r *RawData) { r.Longitude = nil }},
+		{"lat out of range", func(r *RawData) { r.Latitude = f64(95) }},
+		{"lon out of range", func(r *RawData) { r.Longitude = f64(-190) }},
+	}
+	for _, tc := range cases {
+		r := valid
+		tc.mutate(&r)
+		if err := r.Validate(); err == nil {
+			t.Errorf("%s: expected validation error, got nil", tc.name)
+		}
+	}
+}
+
 func TestAnonymizeSignal_FieldDelimiters(t *testing.T) {
 	// Two different identity inputs that would collide without delimiters
-	raw1 := RawData{ID: "ab", Name: "cd", Account: "1234", Amount: 100, Timestamp: "2026-01-01T00:00:00"}
-	raw2 := RawData{ID: "a", Name: "bcd", Account: "1234", Amount: 100, Timestamp: "2026-01-01T00:00:00"}
+	raw1 := RawData{ID: "ab", Name: "cd", Account: "1234", Amount: 100, Timestamp: "2026-01-01T00:00:00Z"}
+	raw2 := RawData{ID: "a", Name: "bcd", Account: "1234", Amount: 100, Timestamp: "2026-01-01T00:00:00Z"}
 
 	sig1 := AnonymizeSignal(raw1, "BNK", "salt", "pepper", 10000)
 	sig2 := AnonymizeSignal(raw2, "BNK", "salt", "pepper", 10000)
@@ -96,7 +152,7 @@ func TestAnonymizeSignal_FieldDelimiters(t *testing.T) {
 }
 
 func TestAnonymizeSignal_NearThreshold(t *testing.T) {
-	raw := RawData{ID: "1", Name: "Test", Account: "ACC", Amount: 9600, Timestamp: "2026-01-01T00:00:00"}
+	raw := RawData{ID: "1", Name: "Test", Account: "ACC", Amount: 9600, Timestamp: "2026-01-01T00:00:00Z"}
 	sig := AnonymizeSignal(raw, "BNK", "salt", "pepper", 10000)
 
 	if _, ok := sig.Metadata["is_near_threshold"]; !ok {
@@ -110,8 +166,17 @@ func TestAnonymizeSignal_NearThreshold(t *testing.T) {
 	}
 }
 
+func TestAnonymizeSignal_MissingLocation(t *testing.T) {
+	raw := RawData{ID: "1", Name: "Test", Account: "ACC", Amount: 100, Timestamp: "2026-01-01T00:00:00Z"}
+	sig := AnonymizeSignal(raw, "BNK", "salt", "pepper", 10000)
+
+	if sig.Metadata["location_zone"] != "ZONE_UNKNOWN" {
+		t.Errorf("missing location should map to ZONE_UNKNOWN, got %v", sig.Metadata["location_zone"])
+	}
+}
+
 func TestAnonymizeSignal_DestinationMosaic(t *testing.T) {
-	raw := RawData{ID: "1", Name: "Test", Account: "ACC", Amount: 100, Timestamp: "2026-01-01T00:00:00", CounterpartyID: "CP123"}
+	raw := RawData{ID: "1", Name: "Test", Account: "ACC", Amount: 100, Timestamp: "2026-01-01T00:00:00Z", CounterpartyID: "CP123"}
 	sig := AnonymizeSignal(raw, "BNK", "salt", "pepper", 10000)
 
 	if sig.DestinationMosaic == "" {
@@ -120,7 +185,7 @@ func TestAnonymizeSignal_DestinationMosaic(t *testing.T) {
 }
 
 func TestAnonymizeSignal_DeviceAndIPHash(t *testing.T) {
-	raw := RawData{ID: "1", Name: "Test", Account: "ACC", Amount: 100, Timestamp: "2026-01-01T00:00:00",
+	raw := RawData{ID: "1", Name: "Test", Account: "ACC", Amount: 100, Timestamp: "2026-01-01T00:00:00Z",
 		DeviceID: "device123", IP: "192.168.1.1"}
 	sig := AnonymizeSignal(raw, "BNK", "salt", "pepper", 10000)
 
@@ -132,7 +197,7 @@ func TestAnonymizeSignal_DeviceAndIPHash(t *testing.T) {
 	}
 
 	// Pre-hashed should pass through
-	raw2 := RawData{ID: "1", Name: "Test", Account: "ACC", Amount: 100, Timestamp: "2026-01-01T00:00:00",
+	raw2 := RawData{ID: "1", Name: "Test", Account: "ACC", Amount: 100, Timestamp: "2026-01-01T00:00:00Z",
 		DeviceIDHash: "prehashed_device", IPHash: "prehashed_ip"}
 	sig2 := AnonymizeSignal(raw2, "BNK", "salt", "pepper", 10000)
 

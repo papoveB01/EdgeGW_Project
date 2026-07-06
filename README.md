@@ -11,7 +11,7 @@ Bank Core System ──POST /process──> Edge Gateway ──anonymize──> 
                                     (never leaves bank)
 ```
 
-**Zero PII leaves the bank.** The gateway replaces personally identifiable information with irreversible hashes (identity mosaics), privacy-preserving tiers, and geohash zones before forwarding to the Hub.
+**No raw PII leaves the bank.** The gateway replaces personally identifiable information with salted/peppered SHA-256 pseudonyms (identity mosaics), privacy-preserving tiers, and geohash zones before forwarding to the Hub. Note this is *pseudonymization*, not full anonymization: parties holding the salt and pepper could dictionary-attack low-entropy inputs, so treat mosaics as personal data under GDPR/NDPR and protect the salt and pepper accordingly.
 
 ## Quick Start
 
@@ -41,15 +41,15 @@ make docker-run
 | Raw PII Field | Anonymized Output | Method |
 |---------------|-------------------|--------|
 | Customer ID + Name | `identity_mosaic` | SHA-256(id \| name \| bank_salt \| regional_pepper) |
-| Transaction Amount | `amount_tier` | TIER_1 (<$500), TIER_2 ($500-2.5K), TIER_3 ($2.5K-10K), TIER_4 (>$10K) |
-| Lat/Long | `location_zone` | Geohash precision 5 (~4.9km grid cells) |
-| Timestamp | Bucketed timestamp | 15-minute window rounding |
+| Transaction Amount | `amount_tier` | TIER_1 (≤$500), TIER_2 ($500–2.5K), TIER_3 ($2.5K–10K), TIER_4 (>$10K) |
+| Lat/Long (optional) | `location_zone` | Geohash precision 5 (~4.9km grid cells); `ZONE_UNKNOWN` when absent |
+| Timestamp | Bucketed timestamp | RFC 3339, normalized to UTC, rounded down to 15-minute windows |
 | Account Number | `account_hash` | SHA-256(account \| bank_salt) |
 | Device ID | `device_id_hash` | SHA-256(device_id \| bank_salt) |
 | IP Address | `ip_hash` | SHA-256(ip \| bank_salt) |
 | Counterparty | `destination_mosaic` | SHA-256(counterparty_id \| bank_salt \| regional_pepper) |
 
-The `identity_mosaic` uses the shared `REGIONAL_PEPPER` so the same person at different banks produces the same hash — enabling cross-bank fraud detection without exposing identity.
+> **Known limitation (cross-bank matching):** the mosaic currently includes the bank-local `BANK_SALT` and the bank-internal customer ID, so the same person at two different banks produces *different* mosaics. Cross-institution matching requires keying the mosaic on a canonical identifier (e.g. BVN/NIN) with the shared pepper only — a coordinated wire-format change with the Hub that is planned but not yet implemented.
 
 ## API Endpoints
 
@@ -57,8 +57,9 @@ The `identity_mosaic` uses the shared `REGIONAL_PEPPER` so the same person at di
 |----------|--------|-------------|
 | `/health` | GET | Service health check |
 | `/metrics` | GET | Operational metrics (signals processed, failures, uptime) |
-| `/process` | POST | Accept raw transaction, anonymize, forward to Hub |
-| `/resolve-pii` | POST | Map identity_mosaic back to local PII (compliance only) |
+| `/process` | POST | Accept raw transaction, anonymize, forward to Hub (requires `INBOUND_API_KEY` when set) |
+
+> A compliance `resolve-pii` endpoint (mosaic → local PII lookup) is planned but intentionally not shipped: it requires a local encrypted audit store and Hub-issued officer JWT validation, neither of which exists yet.
 
 ### POST /process
 
@@ -80,9 +81,9 @@ The `identity_mosaic` uses the shared `REGIONAL_PEPPER` so the same person at di
 }
 ```
 
-Required fields: `id`, `name`, `account`, `amount`, `latitude`, `longitude`, `timestamp`
+Required fields: `id`, `name`, `account`, `amount` (> 0), `timestamp` (RFC 3339 with timezone offset, e.g. `2026-01-15T14:07:33Z`)
 
-Optional fraud detection fields: `device_id`, `ip`, `branch_id`, `signal_type`, `endpoint_type`, `counterparty_id`
+Optional fields: `latitude`/`longitude` (must be provided together; omit for card-not-present transactions → `ZONE_UNKNOWN`), `device_id`, `ip`, `branch_id`, `signal_type`, `endpoint_type`, `counterparty_id`
 
 ## Configuration
 
@@ -99,6 +100,8 @@ Optional fraud detection fields: `device_id`, `ip`, `branch_id`, `signal_type`, 
 | `GATEWAY_PORT` | No | Server port (default: 8080) |
 | `REPORTING_THRESHOLD` | No | AML reporting limit (default: 10000) |
 | `CONFIG_PATH` | No | Path to config JSON file (default: /config/gateway.json) |
+| `INBOUND_API_KEY` | Recommended | Key core banking systems must present on `/process` (`Authorization: Bearer` or `X-Gateway-API-Key`) |
+| `TLS_CERT_FILE` / `TLS_KEY_FILE` | Recommended | Serve HTTPS; without them raw PII transits the bank network unencrypted |
 
 ### Config File
 
@@ -120,12 +123,15 @@ The gateway authenticates to the Hub using a 3-point handshake:
 ## Security Features
 
 - **Distroless container** — no shell, no package manager, nonroot user
-- **Zero PII transmission** — all personal data hashed before leaving the bank
+- **No raw PII transmission** — all personal data pseudonymized before leaving the bank
+- **Inbound authentication** — `/process` requires `INBOUND_API_KEY` (constant-time compare)
+- **TLS listener** — set `TLS_CERT_FILE`/`TLS_KEY_FILE`
 - **HMAC-SHA256 payload signing** — tamper-proof signal integrity
+- **Strict input validation** — RFC 3339 timestamps, positive amounts, coordinate ranges, non-empty identifiers
 - **Request body size limit** — 1MB max to prevent OOM attacks
 - **Structured JSON logging** — no PII in logs
-- **Graceful shutdown** — SIGINT/SIGTERM handling
-- **Retry with exponential backoff** — resilient Hub connectivity
+- **Graceful shutdown** — in-flight requests drain on SIGINT/SIGTERM (15s budget)
+- **Bounded retry with exponential backoff** — 4xx Hub errors are not retried; the full retry budget (~8.25s) fits inside the 10s write timeout; client cancellation stops retries
 
 ## Development
 

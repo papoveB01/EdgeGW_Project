@@ -36,8 +36,24 @@ func SignPayload(payload []byte, secret string) string {
 	return hex.EncodeToString(mac.Sum(nil))
 }
 
-// ForwardToHub sends anonymized signal to IntelFraud Hub. Single attempt.
+// IsPermanent reports whether a forward error will not succeed on retry
+// (4xx from the Hub, config problems).
+func IsPermanent(err error) bool {
+	var perm *permanentError
+	return errors.As(err, &perm)
+}
+
+// ForwardToHub sends an anonymized signal to the IntelFraud Hub. Single attempt.
 func ForwardToHub(ctx context.Context, signal interface{}) error {
+	payload, err := json.Marshal(signal)
+	if err != nil {
+		return &permanentError{fmt.Errorf("failed to marshal signal: %w", err)}
+	}
+	return ForwardPayload(ctx, payload)
+}
+
+// ForwardPayload sends a pre-marshaled signal payload to the Hub. Single attempt.
+func ForwardPayload(ctx context.Context, payload []byte) error {
 	cfg := config.Get()
 	hubURL := cfg.Hub.HubEndpointURL
 	if hubURL == "" {
@@ -58,11 +74,6 @@ func ForwardToHub(ctx context.Context, signal interface{}) error {
 	hmacSecret := os.Getenv("HMAC_SECRET")
 	if hmacSecret == "" {
 		return &permanentError{fmt.Errorf("HMAC_SECRET environment variable not set")}
-	}
-
-	payload, err := json.Marshal(signal)
-	if err != nil {
-		return &permanentError{fmt.Errorf("failed to marshal signal: %w", err)}
 	}
 
 	signature := SignPayload(payload, hmacSecret)
@@ -120,8 +131,7 @@ func ForwardToHubWithRetry(ctx context.Context, signal interface{}, maxRetries i
 			RecordMetric("signals_forwarded", 1)
 			return nil
 		}
-		var perm *permanentError
-		if errors.As(lastErr, &perm) {
+		if IsPermanent(lastErr) {
 			slog.Warn("Hub forward failed permanently, not retrying", "error", lastErr)
 			return lastErr
 		}

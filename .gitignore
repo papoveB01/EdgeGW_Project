@@ -3,6 +3,7 @@ coverage.out
 coverage.html
 .env
 deployments/config/gateway.json
+/spool/
 *.exe
 *.dll
 *.so

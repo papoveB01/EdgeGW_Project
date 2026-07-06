@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -16,6 +17,7 @@ import (
 	"github.com/papoveB01/EdgeGW_Project/internal/config"
 	"github.com/papoveB01/EdgeGW_Project/internal/middleware"
 	"github.com/papoveB01/EdgeGW_Project/internal/processor"
+	"github.com/papoveB01/EdgeGW_Project/internal/spool"
 )
 
 func main() {
@@ -58,12 +60,39 @@ func main() {
 		os.Exit(1)
 	}
 	if os.Getenv("REGIONAL_PEPPER") == "" {
-		slog.Warn("REGIONAL_PEPPER not set - cross-bank matching will not work; use Hub-provided value for production")
+		slog.Error("Required REGIONAL_PEPPER is not set - it keys the global identity mosaics; use the Hub-provided value")
+		os.Exit(1)
 	}
 
 	inboundKey := os.Getenv("INBOUND_API_KEY")
 	if inboundKey == "" {
 		slog.Warn("INBOUND_API_KEY not set - /process accepts unauthenticated requests; set it in production")
+	}
+
+	// Durable spool (recommended): /process persists anonymized signals and
+	// returns 202; a background forwarder delivers them, so Hub outages
+	// neither lose signals nor block the core banking system.
+	var sp *spool.Spool
+	if spoolDir := os.Getenv("SPOOL_DIR"); spoolDir != "" {
+		maxDepth := 10000
+		if v := os.Getenv("SPOOL_MAX_DEPTH"); v != "" {
+			if n, err := strconv.Atoi(v); err == nil && n > 0 {
+				maxDepth = n
+			}
+		}
+		var err error
+		sp, err = spool.New(spoolDir, maxDepth, adapters.ForwardPayload, adapters.IsPermanent, spool.Hooks{
+			OnDelivered: func() { adapters.RecordMetric("signals_forwarded", 1) },
+			OnDead:      func() { adapters.RecordMetric("signals_dead_lettered", 1) },
+			OnDepth:     func(d int) { adapters.SetGauge("spool_depth", int64(d)) },
+		})
+		if err != nil {
+			slog.Error("Failed to open spool", "dir", spoolDir, "error", err)
+			os.Exit(1)
+		}
+		slog.Info("Durable spool enabled", "dir", spoolDir, "max_depth", maxDepth, "pending", sp.Depth())
+	} else {
+		slog.Warn("SPOOL_DIR not set - forwarding synchronously; signals are lost if the Hub is down")
 	}
 
 	slog.Info("Starting Edge Gateway",
@@ -76,7 +105,7 @@ func main() {
 
 	mux.HandleFunc("/health", adapters.HealthCheckHandler)
 	mux.HandleFunc("/metrics", adapters.MetricsHandler)
-	mux.Handle("/process", middleware.RequireAPIKey(http.HandlerFunc(processTransaction), inboundKey))
+	mux.Handle("/process", middleware.RequireAPIKey(processTransaction(sp), inboundKey))
 
 	// Wrap with request logging and body size limit middleware
 	handler := middleware.RequestLogger(middleware.MaxBodySize(mux, 1<<20)) // 1MB limit
@@ -87,6 +116,19 @@ func main() {
 		ReadTimeout:  10 * time.Second,
 		WriteTimeout: 10 * time.Second,
 		IdleTimeout:  120 * time.Second,
+	}
+
+	// Background forwarder for the spool. Undelivered signals stay on disk
+	// across restarts, so stopping it on shutdown is safe.
+	forwardCtx, stopForwarder := context.WithCancel(context.Background())
+	forwarderDone := make(chan struct{})
+	if sp != nil {
+		go func() {
+			sp.Run(forwardCtx)
+			close(forwarderDone)
+		}()
+	} else {
+		close(forwarderDone)
 	}
 
 	// Graceful shutdown: stop accepting connections, let in-flight requests finish.
@@ -121,6 +163,11 @@ func main() {
 		os.Exit(1)
 	}
 	<-shutdownDone
+	stopForwarder()
+	<-forwarderDone
+	if sp != nil && sp.Depth() > 0 {
+		slog.Info("Undelivered signals remain spooled for next start", "pending", sp.Depth())
+	}
 	slog.Info("Server stopped")
 }
 
@@ -149,56 +196,98 @@ func healthcheck() int {
 	return 0
 }
 
-func processTransaction(w http.ResponseWriter, r *http.Request) {
-	startTime := time.Now()
+// processTransaction validates, anonymizes, and hands off one transaction.
+// With a spool: persist and return 202 Accepted (delivery is asynchronous).
+// Without: forward synchronously with bounded retry and return 200/502.
+func processTransaction(sp *spool.Spool) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		startTime := time.Now()
 
-	if r.Method != http.MethodPost {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
 
-	// Parse and validate incoming request
-	rawData, err := adapters.ProcessInboundRequest(r)
-	if err != nil {
-		slog.Error("Invalid request", "error", err)
-		http.Error(w, "Invalid request: "+err.Error(), http.StatusBadRequest)
-		return
-	}
+		// Parse and validate incoming request
+		rawData, err := adapters.ProcessInboundRequest(r)
+		if err != nil {
+			slog.Error("Invalid request", "error", err)
+			http.Error(w, "Invalid request: "+err.Error(), http.StatusBadRequest)
+			return
+		}
 
-	cfg := config.Get()
-	salt := cfg.Local.BankSalt
-	pepper := os.Getenv("REGIONAL_PEPPER")
+		cfg := config.Get()
+		salt := cfg.Local.BankSalt
+		pepper := os.Getenv("REGIONAL_PEPPER")
 
-	anonymized := processor.AnonymizeSignal(*rawData, cfg.Hub.InstitutionID, salt, pepper, cfg.Local.ReportingThreshold)
+		anonymized := processor.AnonymizeSignal(*rawData, cfg.Hub.InstitutionID, salt, pepper, cfg.Local.ReportingThreshold)
 
-	// Forward to Hub with retry
-	if err := adapters.ForwardToHubWithRetry(r.Context(), anonymized, 2); err != nil {
-		slog.Error("Failed to forward to hub",
-			"error", err,
-			"institution_id", anonymized.InstitutionID,
+		if sp != nil {
+			payload, err := json.Marshal(anonymized)
+			if err != nil {
+				http.Error(w, "Failed to encode signal", http.StatusInternalServerError)
+				return
+			}
+			if err := sp.Enqueue(payload); err != nil {
+				adapters.RecordMetric("spool_rejects", 1)
+				if errors.Is(err, spool.ErrFull) {
+					slog.Error("Spool full, rejecting signal", "depth", sp.Depth())
+					http.Error(w, "Signal queue full, retry later", http.StatusServiceUnavailable)
+				} else {
+					slog.Error("Failed to spool signal", "error", err)
+					http.Error(w, "Failed to queue signal", http.StatusInternalServerError)
+				}
+				return
+			}
+			adapters.RecordMetric("signals_processed", 1)
+			slog.Info("Transaction queued",
+				"mosaic_prefix", anonymized.IdentityMosaic[:16],
+				"mosaic_scope", anonymized.MosaicScope,
+				"amount_tier", anonymized.Metadata["amount_tier"],
+				"spool_depth", sp.Depth(),
+			)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusAccepted)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"status":          "queued",
+				"identity_mosaic": anonymized.IdentityMosaic[:16] + "...",
+				"mosaic_scope":    anonymized.MosaicScope,
+				"spool_depth":     sp.Depth(),
+			})
+			return
+		}
+
+		// Synchronous mode: forward to Hub with bounded retry
+		if err := adapters.ForwardToHubWithRetry(r.Context(), anonymized, 2); err != nil {
+			slog.Error("Failed to forward to hub",
+				"error", err,
+				"institution_id", anonymized.InstitutionID,
+				"mosaic_prefix", anonymized.IdentityMosaic[:16],
+			)
+			adapters.RecordMetric("forward_failures", 1)
+			http.Error(w, "Failed to forward signal to hub: "+err.Error(), http.StatusBadGateway)
+			return
+		}
+
+		processingTime := time.Since(startTime)
+		adapters.RecordMetric("signals_processed", 1)
+		adapters.RecordMetric("processing_time_ms_total", processingTime.Milliseconds())
+
+		slog.Info("Transaction processed",
+			"processing_time", processingTime.String(),
 			"mosaic_prefix", anonymized.IdentityMosaic[:16],
+			"mosaic_scope", anonymized.MosaicScope,
+			"institution_id", anonymized.InstitutionID,
+			"amount_tier", anonymized.Metadata["amount_tier"],
 		)
-		adapters.RecordMetric("forward_failures", 1)
-		http.Error(w, "Failed to forward signal to hub: "+err.Error(), http.StatusBadGateway)
-		return
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"status":             "processed",
+			"processing_time_ms": processingTime.Milliseconds(),
+			"identity_mosaic":    anonymized.IdentityMosaic[:16] + "...",
+			"mosaic_scope":       anonymized.MosaicScope,
+		})
 	}
-
-	processingTime := time.Since(startTime)
-	adapters.RecordMetric("signals_processed", 1)
-	adapters.RecordMetric("processing_time_ms_total", processingTime.Milliseconds())
-
-	slog.Info("Transaction processed",
-		"processing_time", processingTime.String(),
-		"mosaic_prefix", anonymized.IdentityMosaic[:16],
-		"institution_id", anonymized.InstitutionID,
-		"amount_tier", anonymized.Metadata["amount_tier"],
-	)
-
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"status":             "processed",
-		"processing_time_ms": processingTime.Milliseconds(),
-		"identity_mosaic":    anonymized.IdentityMosaic[:16] + "...",
-	})
 }

@@ -24,8 +24,12 @@ services:
       - INBOUND_API_KEY=${INBOUND_API_KEY:-}
       - TLS_CERT_FILE=${TLS_CERT_FILE:-}
       - TLS_KEY_FILE=${TLS_KEY_FILE:-}
+      # Durable queue: signals survive Hub outages and gateway restarts
+      - SPOOL_DIR=${SPOOL_DIR:-/spool}
+      - SPOOL_MAX_DEPTH=${SPOOL_MAX_DEPTH:-10000}
     volumes:
       - ./config:/config:ro
+      - spool-data:/spool
     healthcheck:
       # Distroless image has no shell/wget — the binary probes itself.
       test: ["CMD", "/edge-gateway", "-healthcheck"]
@@ -33,3 +37,6 @@ services:
       timeout: 10s
       retries: 5
       start_period: 10s
+
+volumes:
+  spool-data:

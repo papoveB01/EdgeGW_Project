@@ -138,6 +138,88 @@ func TestValidate(t *testing.T) {
 	}
 }
 
+func TestAnonymizeSignal_GlobalMosaicCrossBank(t *testing.T) {
+	// Same person (same national ID) at two banks with different salts and
+	// different internal customer IDs must produce the SAME global mosaic.
+	atBankA := RawData{ID: "CUST-001", Name: "John Doe", NationalID: "22345678901",
+		Account: "ACC-A", Amount: 100, Timestamp: "2026-01-01T00:00:00Z"}
+	atBankB := RawData{ID: "CIF-99887", Name: "DOE, JOHN", NationalID: "2234-5678 901",
+		Account: "ACC-B", Amount: 100, Timestamp: "2026-01-01T00:00:00Z"}
+
+	sigA := AnonymizeSignal(atBankA, "BNK_A", "salt_a", "shared_pepper", 10000)
+	sigB := AnonymizeSignal(atBankB, "BNK_B", "salt_b", "shared_pepper", 10000)
+
+	if sigA.IdentityMosaic != sigB.IdentityMosaic {
+		t.Error("same national ID at different banks must produce the same global mosaic")
+	}
+	if sigA.MosaicScope != ScopeGlobal || sigB.MosaicScope != ScopeGlobal {
+		t.Errorf("expected global scope, got %s / %s", sigA.MosaicScope, sigB.MosaicScope)
+	}
+	if sigA.MosaicVersion != MosaicVersion {
+		t.Errorf("expected mosaic version %d, got %d", MosaicVersion, sigA.MosaicVersion)
+	}
+
+	// Different pepper must produce a different mosaic (pepper is the key).
+	sigC := AnonymizeSignal(atBankA, "BNK_A", "salt_a", "other_pepper", 10000)
+	if sigC.IdentityMosaic == sigA.IdentityMosaic {
+		t.Error("different pepper must change the global mosaic")
+	}
+}
+
+func TestAnonymizeSignal_LocalMosaicFallback(t *testing.T) {
+	// Without a national ID the mosaic is bank-local: salted, scope=local,
+	// and name casing/spacing differences don't split identities.
+	raw1 := RawData{ID: "CUST-001", Name: "John Doe", Account: "A", Amount: 100, Timestamp: "2026-01-01T00:00:00Z"}
+	raw2 := RawData{ID: "cust-001", Name: "  JOHN   DOE ", Account: "A", Amount: 100, Timestamp: "2026-01-01T00:00:00Z"}
+
+	sig1 := AnonymizeSignal(raw1, "BNK", "salt", "pepper", 10000)
+	sig2 := AnonymizeSignal(raw2, "BNK", "salt", "pepper", 10000)
+
+	if sig1.MosaicScope != ScopeLocal {
+		t.Errorf("expected local scope without national_id, got %s", sig1.MosaicScope)
+	}
+	if sig1.IdentityMosaic != sig2.IdentityMosaic {
+		t.Error("normalization should make casing/spacing variants produce the same local mosaic")
+	}
+
+	// Different salts (different banks) must produce different local mosaics.
+	sig3 := AnonymizeSignal(raw1, "BNK2", "other_salt", "pepper", 10000)
+	if sig3.IdentityMosaic == sig1.IdentityMosaic {
+		t.Error("local mosaics must differ across banks (different salts)")
+	}
+}
+
+func TestAnonymizeSignal_DestinationMatchesIdentity(t *testing.T) {
+	// A counterparty's global destination mosaic must equal the identity
+	// mosaic that counterparty produces for their own transactions.
+	sender := RawData{ID: "S", Name: "Sender", Account: "A1", Amount: 100, Timestamp: "2026-01-01T00:00:00Z",
+		CounterpartyID: "CP-1", CounterpartyNationalID: "99887766554"}
+	counterpartyOwnTxn := RawData{ID: "CP-1", Name: "Mule Person", NationalID: "99887766554",
+		Account: "A2", Amount: 50, Timestamp: "2026-01-01T00:00:00Z"}
+
+	sent := AnonymizeSignal(sender, "BNK_A", "salt_a", "pepper", 10000)
+	own := AnonymizeSignal(counterpartyOwnTxn, "BNK_B", "salt_b", "pepper", 10000)
+
+	if sent.DestinationMosaic != own.IdentityMosaic {
+		t.Error("global destination mosaic must match the counterparty's own identity mosaic")
+	}
+	if sent.DestinationMosaicScope != ScopeGlobal {
+		t.Errorf("expected global destination scope, got %s", sent.DestinationMosaicScope)
+	}
+}
+
+func TestNormalize(t *testing.T) {
+	if NormalizeID("2234-5678 901") != "22345678901" {
+		t.Errorf("NormalizeID should strip separators: %q", NormalizeID("2234-5678 901"))
+	}
+	if NormalizeID("abc.123") != "ABC123" {
+		t.Errorf("NormalizeID should uppercase and strip dots: %q", NormalizeID("abc.123"))
+	}
+	if NormalizeName("  john   Doe ") != "JOHN DOE" {
+		t.Errorf("NormalizeName should collapse whitespace and uppercase: %q", NormalizeName("  john   Doe "))
+	}
+}
+
 func TestAnonymizeSignal_FieldDelimiters(t *testing.T) {
 	// Two different identity inputs that would collide without delimiters
 	raw1 := RawData{ID: "ab", Name: "cd", Account: "1234", Amount: 100, Timestamp: "2026-01-01T00:00:00Z"}
@@ -181,6 +263,9 @@ func TestAnonymizeSignal_DestinationMosaic(t *testing.T) {
 
 	if sig.DestinationMosaic == "" {
 		t.Error("expected destination_mosaic when counterparty_id is set")
+	}
+	if sig.DestinationMosaicScope != ScopeLocal {
+		t.Errorf("counterparty_id without national ID should be local scope, got %s", sig.DestinationMosaicScope)
 	}
 }
 

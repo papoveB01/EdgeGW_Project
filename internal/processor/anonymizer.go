@@ -1,33 +1,50 @@
 package processor
 
 import (
+	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
 	"math"
 	"strings"
 	"time"
+	"unicode"
+)
+
+// MosaicVersion identifies the mosaic derivation scheme so the Hub can
+// distinguish signals produced by different gateway generations.
+const MosaicVersion = 2
+
+// Mosaic scopes: global mosaics are keyed only with the shared regional pepper
+// over a canonical identifier (BVN/NIN), so the same person produces the same
+// mosaic at every member bank. Local mosaics include the bank salt and
+// bank-internal identifiers — they are stable within one institution only.
+const (
+	ScopeGlobal = "global"
+	ScopeLocal  = "local"
 )
 
 // RawData represents incoming transaction data with PII and optional fraud-detection fields.
 // Latitude/Longitude are optional (card-not-present and online transactions often
 // have no meaningful coordinates); absent location maps to ZONE_UNKNOWN.
 type RawData struct {
-	ID             string   `json:"id"`
-	Name           string   `json:"name"`
-	Account        string   `json:"account"`
-	Amount         float64  `json:"amount"`
-	Latitude       *float64 `json:"latitude,omitempty"`
-	Longitude      *float64 `json:"longitude,omitempty"`
-	Timestamp      string   `json:"timestamp"`
-	DeviceID       string   `json:"device_id,omitempty"`
-	DeviceIDHash   string   `json:"device_id_hash,omitempty"`
-	IP             string   `json:"ip,omitempty"`
-	IPHash         string   `json:"ip_hash,omitempty"`
-	BranchID       string   `json:"branch_id,omitempty"`
-	SignalType     string   `json:"signal_type,omitempty"`
-	EndpointType   string   `json:"endpoint_type,omitempty"`
-	CounterpartyID string   `json:"counterparty_id,omitempty"`
+	ID                     string   `json:"id"`
+	Name                   string   `json:"name"`
+	NationalID             string   `json:"national_id,omitempty"`
+	Account                string   `json:"account"`
+	Amount                 float64  `json:"amount"`
+	Latitude               *float64 `json:"latitude,omitempty"`
+	Longitude              *float64 `json:"longitude,omitempty"`
+	Timestamp              string   `json:"timestamp"`
+	DeviceID               string   `json:"device_id,omitempty"`
+	DeviceIDHash           string   `json:"device_id_hash,omitempty"`
+	IP                     string   `json:"ip,omitempty"`
+	IPHash                 string   `json:"ip_hash,omitempty"`
+	BranchID               string   `json:"branch_id,omitempty"`
+	SignalType             string   `json:"signal_type,omitempty"`
+	EndpointType           string   `json:"endpoint_type,omitempty"`
+	CounterpartyID         string   `json:"counterparty_id,omitempty"`
+	CounterpartyNationalID string   `json:"counterparty_national_id,omitempty"`
 }
 
 // Validate checks required fields hold usable values, not just that keys exist.
@@ -73,18 +90,49 @@ func (e *ValidationError) Error() string {
 
 // AnonymizedSignal represents the anonymized output — no PII.
 type AnonymizedSignal struct {
-	InstitutionID     string                 `json:"institution_id"`
-	SignalType        string                 `json:"signal_type"`
-	IdentityMosaic    string                 `json:"identity_mosaic"`
-	Timestamp         string                 `json:"timestamp"`
-	Metadata          map[string]interface{} `json:"metadata"`
-	DestinationMosaic string                 `json:"destination_mosaic,omitempty"`
+	InstitutionID          string                 `json:"institution_id"`
+	SignalType             string                 `json:"signal_type"`
+	IdentityMosaic         string                 `json:"identity_mosaic"`
+	MosaicScope            string                 `json:"mosaic_scope"`
+	MosaicVersion          int                    `json:"mosaic_version"`
+	Timestamp              string                 `json:"timestamp"`
+	Metadata               map[string]interface{} `json:"metadata"`
+	DestinationMosaic      string                 `json:"destination_mosaic,omitempty"`
+	DestinationMosaicScope string                 `json:"destination_mosaic_scope,omitempty"`
 }
 
 // Hash creates a SHA-256 hash of the input string.
 func Hash(input string) string {
 	hash := sha256.Sum256([]byte(input))
 	return hex.EncodeToString(hash[:])
+}
+
+// HMACHash computes hex-encoded HMAC-SHA256(key, message). Mosaics use a keyed
+// MAC rather than plain concatenation-hashing so an attacker without the key
+// cannot mount an offline dictionary attack on low-entropy identifiers.
+func HMACHash(key, message string) string {
+	mac := hmac.New(sha256.New, []byte(key))
+	mac.Write([]byte(message))
+	return hex.EncodeToString(mac.Sum(nil))
+}
+
+// NormalizeID strips whitespace, dots and dashes and uppercases, so
+// "2234-5678 901" and "22345678901" produce the same mosaic.
+func NormalizeID(s string) string {
+	var b strings.Builder
+	for _, r := range s {
+		if unicode.IsSpace(r) || r == '-' || r == '.' {
+			continue
+		}
+		b.WriteRune(unicode.ToUpper(r))
+	}
+	return b.String()
+}
+
+// NormalizeName uppercases and collapses whitespace so casing/spacing
+// differences don't split one person into multiple local mosaics.
+func NormalizeName(s string) string {
+	return strings.Join(strings.Fields(strings.ToUpper(s)), " ")
 }
 
 // MapToTier converts exact amount to privacy-preserving tier.
@@ -167,9 +215,20 @@ func BucketTimestamp(ts string) string {
 // AnonymizeSignal processes raw PII data into an anonymized signal.
 // Uses delimited field concatenation to prevent boundary collisions.
 func AnonymizeSignal(rawPii RawData, institutionID string, salt string, pepper string, reportingThreshold float64) AnonymizedSignal {
-	// 1. Identity Mosaic: SHA-256 with delimiters to prevent field boundary collisions
-	mosaicInput := rawPii.ID + "|" + rawPii.Name + "|" + salt + "|" + pepper
-	mosaic := Hash(mosaicInput)
+	// 1. Identity Mosaic (v2).
+	// With a canonical national ID (BVN/NIN): HMAC keyed by the shared pepper
+	// only, so every member bank derives the same mosaic for the same person.
+	// Without one: HMAC keyed by salt+pepper over normalized local identity —
+	// stable within this institution only, tagged ScopeLocal so the Hub
+	// doesn't attempt cross-bank matching on it.
+	var mosaic, mosaicScope string
+	if nid := NormalizeID(rawPii.NationalID); nid != "" {
+		mosaic = HMACHash(pepper, "v2|id|"+nid)
+		mosaicScope = ScopeGlobal
+	} else {
+		mosaic = HMACHash(salt+"|"+pepper, "v2|local|"+NormalizeID(rawPii.ID)+"|"+NormalizeName(rawPii.Name))
+		mosaicScope = ScopeLocal
+	}
 
 	// 2. Amount tier
 	tier := MapToTier(rawPii.Amount)
@@ -229,13 +288,22 @@ func AnonymizeSignal(rawPii RawData, institutionID string, salt string, pepper s
 		InstitutionID:  institutionID,
 		SignalType:     signalType,
 		IdentityMosaic: mosaic,
+		MosaicScope:    mosaicScope,
+		MosaicVersion:  MosaicVersion,
 		Timestamp:      bucketedTimestamp,
 		Metadata:       meta,
 	}
 
-	// Destination mosaic for Mule Route detection
-	if rawPii.CounterpartyID != "" {
-		out.DestinationMosaic = Hash(rawPii.CounterpartyID + "|" + salt + "|" + pepper)
+	// Destination mosaic for Mule Route detection. The global derivation is
+	// identical to the identity mosaic's, so a counterparty's destination
+	// mosaic matches their own identity mosaic when they transact — exactly
+	// what route-following needs.
+	if cn := NormalizeID(rawPii.CounterpartyNationalID); cn != "" {
+		out.DestinationMosaic = HMACHash(pepper, "v2|id|"+cn)
+		out.DestinationMosaicScope = ScopeGlobal
+	} else if rawPii.CounterpartyID != "" {
+		out.DestinationMosaic = HMACHash(salt+"|"+pepper, "v2|local|"+NormalizeID(rawPii.CounterpartyID))
+		out.DestinationMosaicScope = ScopeLocal
 	}
 
 	return out

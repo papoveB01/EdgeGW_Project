@@ -11,7 +11,7 @@ Bank Core System ──POST /process──> Edge Gateway ──anonymize──> 
                                     (never leaves bank)
 ```
 
-**No raw PII leaves the bank.** The gateway replaces personally identifiable information with salted/peppered SHA-256 pseudonyms (identity mosaics), privacy-preserving tiers, and geohash zones before forwarding to the Hub. Note this is *pseudonymization*, not full anonymization: parties holding the salt and pepper could dictionary-attack low-entropy inputs, so treat mosaics as personal data under GDPR/NDPR and protect the salt and pepper accordingly.
+**No raw PII leaves the bank.** The gateway replaces personally identifiable information with keyed HMAC-SHA256 pseudonyms (identity mosaics), privacy-preserving tiers, and geohash zones before forwarding to the Hub. Note this is *pseudonymization*, not full anonymization: parties holding the HMAC keys (salt/pepper) could dictionary-attack low-entropy inputs, so treat mosaics as personal data under GDPR/NDPR and protect the salt and pepper accordingly.
 
 ## Quick Start
 
@@ -40,24 +40,33 @@ make docker-run
 
 | Raw PII Field | Anonymized Output | Method |
 |---------------|-------------------|--------|
-| Customer ID + Name | `identity_mosaic` | SHA-256(id \| name \| bank_salt \| regional_pepper) |
+| National ID (BVN/NIN) | `identity_mosaic` (scope `global`) | HMAC-SHA256(key=regional_pepper, "v2\|id\|" + normalized national_id) |
+| Customer ID + Name (fallback) | `identity_mosaic` (scope `local`) | HMAC-SHA256(key=bank_salt\|pepper, "v2\|local\|" + normalized id\|name) |
 | Transaction Amount | `amount_tier` | TIER_1 (≤$500), TIER_2 ($500–2.5K), TIER_3 ($2.5K–10K), TIER_4 (>$10K) |
 | Lat/Long (optional) | `location_zone` | Geohash precision 5 (~4.9km grid cells); `ZONE_UNKNOWN` when absent |
 | Timestamp | Bucketed timestamp | RFC 3339, normalized to UTC, rounded down to 15-minute windows |
 | Account Number | `account_hash` | SHA-256(account \| bank_salt) |
 | Device ID | `device_id_hash` | SHA-256(device_id \| bank_salt) |
 | IP Address | `ip_hash` | SHA-256(ip \| bank_salt) |
-| Counterparty | `destination_mosaic` | SHA-256(counterparty_id \| bank_salt \| regional_pepper) |
+| Counterparty National ID | `destination_mosaic` (scope `global`) | Same derivation as global identity mosaic |
+| Counterparty ID (fallback) | `destination_mosaic` (scope `local`) | HMAC-SHA256(key=bank_salt\|pepper, "v2\|local\|" + normalized counterparty_id) |
 
-> **Known limitation (cross-bank matching):** the mosaic currently includes the bank-local `BANK_SALT` and the bank-internal customer ID, so the same person at two different banks produces *different* mosaics. Cross-institution matching requires keying the mosaic on a canonical identifier (e.g. BVN/NIN) with the shared pepper only — a coordinated wire-format change with the Hub that is planned but not yet implemented.
+### Mosaic scopes (v2)
+
+Every signal carries `mosaic_scope` and `mosaic_version` so the Hub knows what it can match:
+
+- **`global`** — derived from a canonical national identifier (BVN/NIN) keyed *only* with the shared `REGIONAL_PEPPER`. The same person produces the same mosaic at every member bank, enabling cross-institutional pattern detection. Identifiers are normalized (case, whitespace, dashes) before hashing, and the global destination-mosaic derivation matches the identity derivation — so mule-route hops link up.
+- **`local`** — fallback when no national ID is supplied. Keyed with the bank salt as well, so it's stable within one institution only; the Hub should not attempt cross-bank matching on local mosaics.
+
+Send `national_id` (and `counterparty_national_id` on transfers) whenever available — without them, signals still contribute to single-institution detection but not cross-bank correlation.
 
 ## API Endpoints
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
 | `/health` | GET | Service health check |
-| `/metrics` | GET | Operational metrics (signals processed, failures, uptime) |
-| `/process` | POST | Accept raw transaction, anonymize, forward to Hub (requires `INBOUND_API_KEY` when set) |
+| `/metrics` | GET | Operational metrics (signals processed, spool depth, failures, uptime) |
+| `/process` | POST | Accept raw transaction, anonymize, deliver to Hub (requires `INBOUND_API_KEY` when set). With `SPOOL_DIR` set: persists the anonymized signal and returns **202 Accepted**; a background forwarder delivers it. Without: forwards synchronously and returns 200 (or 502 on failure). |
 
 > A compliance `resolve-pii` endpoint (mosaic → local PII lookup) is planned but intentionally not shipped: it requires a local encrypted audit store and Hub-issued officer JWT validation, neither of which exists yet.
 
@@ -67,6 +76,7 @@ make docker-run
 {
   "id": "CUST-001",
   "name": "John Doe",
+  "national_id": "22345678901",
   "account": "ACC-1234567890",
   "amount": 9500.00,
   "latitude": 6.4541,
@@ -83,7 +93,7 @@ make docker-run
 
 Required fields: `id`, `name`, `account`, `amount` (> 0), `timestamp` (RFC 3339 with timezone offset, e.g. `2026-01-15T14:07:33Z`)
 
-Optional fields: `latitude`/`longitude` (must be provided together; omit for card-not-present transactions → `ZONE_UNKNOWN`), `device_id`, `ip`, `branch_id`, `signal_type`, `endpoint_type`, `counterparty_id`
+Optional fields: `national_id` (BVN/NIN — enables cross-bank matching), `latitude`/`longitude` (must be provided together; omit for card-not-present transactions → `ZONE_UNKNOWN`), `device_id`, `ip`, `branch_id`, `signal_type`, `endpoint_type`, `counterparty_id`, `counterparty_national_id`
 
 ## Configuration
 
@@ -96,7 +106,9 @@ Optional fields: `latitude`/`longitude` (must be provided together; omit for car
 | `HMAC_SECRET` | Yes | HMAC signing secret from Hub onboarding |
 | `HUB_API_URL` | Yes | Hub signal endpoint URL |
 | `BANK_SALT` | Yes | Local salt for hashing (min 32 chars, never shared) |
-| `REGIONAL_PEPPER` | Yes | Shared pepper from Hub (enables cross-bank matching) |
+| `REGIONAL_PEPPER` | Yes | Shared pepper from Hub — the HMAC key for global mosaics (enables cross-bank matching) |
+| `SPOOL_DIR` | Recommended | Durable queue directory; enables async 202 mode so Hub outages don't lose signals (Docker default: `/spool`) |
+| `SPOOL_MAX_DEPTH` | No | Max queued signals before /process returns 503 (default: 10000) |
 | `GATEWAY_PORT` | No | Server port (default: 8080) |
 | `REPORTING_THRESHOLD` | No | AML reporting limit (default: 10000) |
 | `CONFIG_PATH` | No | Path to config JSON file (default: /config/gateway.json) |
@@ -131,7 +143,8 @@ The gateway authenticates to the Hub using a 3-point handshake:
 - **Request body size limit** — 1MB max to prevent OOM attacks
 - **Structured JSON logging** — no PII in logs
 - **Graceful shutdown** — in-flight requests drain on SIGINT/SIGTERM (15s budget)
-- **Bounded retry with exponential backoff** — 4xx Hub errors are not retried; the full retry budget (~8.25s) fits inside the 10s write timeout; client cancellation stops retries
+- **Durable spool** — anonymized signals (never raw PII) persist to disk before acknowledgment; delivery survives Hub outages and gateway restarts, with dead-lettering for permanently rejected signals
+- **Bounded retry with exponential backoff** — 4xx Hub errors are not retried; in synchronous mode the full retry budget (~8.25s) fits inside the 10s write timeout; client cancellation stops retries
 
 ## Development
 

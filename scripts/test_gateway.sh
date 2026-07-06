@@ -19,6 +19,7 @@ curl -s -X POST "$GW_URL/process" \
   -d "{
     \"id\": \"CUST-001\",
     \"name\": \"John Doe\",
+    \"national_id\": \"22345678901\",
     \"account\": \"ACC-1234567890\",
     \"amount\": 9500.00,
     \"latitude\": 6.4541,
@@ -43,6 +44,7 @@ curl -s -X POST "$GW_URL/process" \
     \"longitude\": 3.3947,
     \"timestamp\": \"$TIMESTAMP\",
     \"counterparty_id\": \"CUST-999\",
+    \"counterparty_national_id\": \"99887766554\",
     \"signal_type\": \"transaction\",
     \"endpoint_type\": \"BRANCH\"
   }" | python3 -m json.tool 2>/dev/null || echo "(raw output above)"

@@ -100,7 +100,8 @@
   .bento{display:grid;grid-template-columns:repeat(3,1fr);gap:18px}
   .b-card{background:#fff;border:1px solid var(--slate-200);border-radius:var(--radius);padding:26px;transition:.25s}
   .b-card:hover{border-color:var(--emerald);box-shadow:0 12px 30px -12px var(--emerald-glow);transform:translateY(-3px)}
-  .b-icon{width:44px;height:44px;border-radius:11px;background:var(--emerald-light);display:flex;align-items:center;justify-content:center;margin-bottom:16px;font-size:1.35rem}
+  .b-icon{width:44px;height:44px;border-radius:11px;background:var(--emerald-light);display:flex;align-items:center;justify-content:center;margin-bottom:16px}
+  .b-icon svg{width:22px;height:22px;stroke:var(--emerald-dark);fill:none}
   .b-card h3{font-size:1.12rem;font-weight:700;color:var(--slate-900);margin-bottom:8px;letter-spacing:-.01em}
   .b-card p{font-size:.94rem;color:var(--slate-500)}
   .b-card code{font-family:var(--mono);font-size:.85em;background:var(--slate-100);padding:1px 6px;border-radius:5px;color:var(--slate-700)}
@@ -348,32 +349,32 @@
     </div>
     <div class="bento">
       <div class="b-card b-wide">
-        <div class="b-icon">🔗</div>
+        <div class="b-icon"><svg viewBox="0 0 24 24" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="5" cy="6" r="2.5"/><circle cx="19" cy="6" r="2.5"/><circle cx="12" cy="18" r="2.5"/><path d="M7 7.6l3.6 8.2M17 7.6l-3.6 8.2M7.5 6h9"/></svg></div>
         <h3>Cross-bank identity mosaics (v2)</h3>
         <p>With a national identifier, the identity mosaic is an <code>HMAC-SHA256</code> keyed only by the shared regional pepper — so the same person yields the same mosaic at every member bank, enabling cross-institutional pattern detection. Without one, it falls back to a bank-local mosaic. Every signal is tagged <code>global</code> or <code>local</code> so the Hub knows what it may correlate.</p>
       </div>
       <div class="b-card">
-        <div class="b-icon">💾</div>
+        <div class="b-icon"><svg viewBox="0 0 24 24" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><ellipse cx="12" cy="5" rx="7" ry="2.6"/><path d="M5 5v6c0 1.4 3.1 2.6 7 2.6s7-1.2 7-2.6V5"/><path d="M5 11v6c0 1.4 3.1 2.6 7 2.6s7-1.2 7-2.6v-6"/></svg></div>
         <h3>Durable spool</h3>
         <p>Signals are persisted before acknowledgment and delivered by a background forwarder. Hub outages and restarts don't lose data — permanently rejected signals dead-letter instead of blocking the queue.</p>
       </div>
       <div class="b-card">
-        <div class="b-icon">🎭</div>
+        <div class="b-icon"><svg viewBox="0 0 24 24" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h3.5l9 10H20M4 17h3.5l2.2-2.4M14.5 8.4 16.5 7H20M17 4l3 3-3 3M17 14l3 3-3 3"/></svg></div>
         <h3>Privacy-preserving transforms</h3>
         <p>Amount → tier, lat/long → geohash zone, timestamp → 15-minute UTC bucket, account / device / IP → salted hashes. Enough signal to detect fraud, not enough to re-identify.</p>
       </div>
       <div class="b-card">
-        <div class="b-icon">🕵️</div>
+        <div class="b-icon"><svg viewBox="0 0 24 24" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="5" cy="19" r="2.2"/><circle cx="19" cy="5" r="2.2"/><circle cx="12" cy="12" r="2.2"/><path d="M6.6 17.4 10.4 13.6M13.6 10.4 17.4 6.6"/></svg></div>
         <h3>Structuring &amp; mule-route flags</h3>
         <p>Near-threshold amounts are flagged for multi-bank structuring; a counterparty's destination mosaic matches their own identity mosaic, so the Hub can follow mule routes across institutions.</p>
       </div>
       <div class="b-card">
-        <div class="b-icon">🔐</div>
+        <div class="b-icon"><svg viewBox="0 0 24 24" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3 5 6v5.5c0 4 3 6.6 7 8 4-1.4 7-4 7-8V6l-7-3Z"/><path d="M9 12l2 2 4-4"/></svg></div>
         <h3>Signed &amp; authenticated</h3>
         <p>HMAC-SHA256 payload signing to the Hub, inbound API-key auth on <code>/process</code>, optional TLS, a 1&nbsp;MB body cap, and PII-free structured logs.</p>
       </div>
       <div class="b-card">
-        <div class="b-icon">📦</div>
+        <div class="b-icon"><svg viewBox="0 0 24 24" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3 4 7v10l8 4 8-4V7l-8-4Z"/><path d="M4 7l8 4 8-4M12 11v10"/></svg></div>
         <h3>One hardened binary</h3>
         <p>Distroless, nonroot, no shell — a single static Go binary with no runtime dependencies. Graceful shutdown, bounded retry with backoff, and a self-probing health check.</p>
       </div>

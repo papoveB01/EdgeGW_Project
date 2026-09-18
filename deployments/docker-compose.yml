@@ -31,18 +31,19 @@ services:
       #   its way.
       - GATEWAY_MODE=${GATEWAY_MODE:-middleware}
 
-      # ─── Vendor platform params (required in middleware mode) ──────
-      # All four use ${VAR?...} (no colon - see comment above): fails
+      # ─── Vendor platform params (required in middleware mode only) ─
+      # All three use ${VAR?...} (no colon - see comment above): fails
       # `docker compose up` with a clear one-line error if forgotten
       # entirely, but allows an explicit empty value for standalone mode.
-      - INSTITUTION_ID=${INSTITUTION_ID:?Set INSTITUTION_ID}
       - API_KEY=${API_KEY?Set API_KEY (required in middleware mode; set to an explicit empty value for standalone, e.g. API_KEY= in .env)}
       - HMAC_SECRET=${HMAC_SECRET?Set HMAC_SECRET (required in middleware mode; set to an explicit empty value for standalone, e.g. HMAC_SECRET= in .env)}
       - HUB_API_URL=${HUB_API_URL?Set HUB_API_URL (required in middleware mode, no placeholder default is used; set to an explicit empty value for standalone, e.g. HUB_API_URL= in .env)}
 
       # ─── Local params (managed by the bank, never sent externally) ─
-      # INSTITUTION_ID/BANK_SALT are always required (both modes), so they
-      # keep ${VAR:?...} - an empty value is never acceptable for them.
+      # INSTITUTION_ID/BANK_SALT are required in BOTH modes (unlike the
+      # vendor params above), so they keep ${VAR:?...} - an empty value is
+      # never acceptable for them, in middleware or standalone.
+      - INSTITUTION_ID=${INSTITUTION_ID:?Set INSTITUTION_ID}
       - BANK_SALT=${BANK_SALT:?Set BANK_SALT (min 32 chars)}
       - REGIONAL_PEPPER=${REGIONAL_PEPPER?Set REGIONAL_PEPPER (required in middleware mode; set to an explicit empty value for standalone, e.g. REGIONAL_PEPPER= in .env)}
 

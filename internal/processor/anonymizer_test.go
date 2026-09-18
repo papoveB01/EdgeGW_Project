@@ -2,6 +2,7 @@ package processor
 
 import (
 	"math"
+	"strings"
 	"testing"
 )
 
@@ -128,6 +129,8 @@ func TestValidate(t *testing.T) {
 		{"lat without lon", func(r *RawData) { r.Longitude = nil }},
 		{"lat out of range", func(r *RawData) { r.Latitude = f64(95) }},
 		{"lon out of range", func(r *RawData) { r.Longitude = f64(-190) }},
+		{"unknown signal_type", func(r *RawData) { r.SignalType = "behavioural_profile" }},
+		{"unknown endpoint_type", func(r *RawData) { r.EndpointType = "SMART_FRIDGE" }},
 	}
 	for _, tc := range cases {
 		r := valid
@@ -291,5 +294,425 @@ func TestAnonymizeSignal_DeviceAndIPHash(t *testing.T) {
 	}
 	if sig2.Metadata["ip_hash"] != "prehashed_ip" {
 		t.Error("pre-hashed ip_hash should pass through")
+	}
+}
+
+func TestValidate_SignalTypeAllowlist(t *testing.T) {
+	base := RawData{ID: "1", Name: "Test", Account: "ACC", Amount: 100, Timestamp: "2026-01-15T14:07:33Z"}
+
+	tests := []struct {
+		name       string
+		signalType string
+		wantErr    bool
+	}{
+		{"empty defaults, allowed", "", false},
+		{"known: transaction", "transaction", false},
+		{"known: login", "login", false},
+		{"known: transfer", "transfer", false},
+		{"known: authentication", "authentication", false},
+		{"unknown value rejected", "general_behaviour", true},
+		// Matching is case-insensitive (see TestValidate_SignalTypeCaseInsensitiveNormalization
+		// for the normalization assertion) — mixed case of a KNOWN value is accepted.
+		{"mixed case of known value accepted", "Transaction", false},
+		{"unknown value still rejected regardless of case", "General_Behaviour", true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r := base
+			r.SignalType = tt.signalType
+			err := r.Validate()
+			if tt.wantErr && err == nil {
+				t.Errorf("signal_type %q: expected validation error, got nil", tt.signalType)
+			}
+			if !tt.wantErr && err != nil {
+				t.Errorf("signal_type %q: unexpected validation error: %v", tt.signalType, err)
+			}
+			if tt.wantErr {
+				var ve *ValidationError
+				if !isValidationError(err, &ve) {
+					t.Fatalf("signal_type %q: expected *ValidationError, got %T", tt.signalType, err)
+				}
+				if ve.Field != "signal_type" {
+					t.Errorf("signal_type %q: expected error field %q, got %q", tt.signalType, "signal_type", ve.Field)
+				}
+			}
+		})
+	}
+}
+
+func TestValidate_EndpointTypeAllowlist(t *testing.T) {
+	base := RawData{ID: "1", Name: "Test", Account: "ACC", Amount: 100, Timestamp: "2026-01-15T14:07:33Z"}
+
+	tests := []struct {
+		name         string
+		endpointType string
+		wantErr      bool
+	}{
+		{"empty is allowed", "", false},
+		{"known: MOBILE_APP", "MOBILE_APP", false},
+		{"known: ATM", "ATM", false},
+		{"known: POS", "POS", false},
+		{"known: WEB", "WEB", false},
+		{"known: BRANCH", "BRANCH", false},
+		{"known: API", "API", false},
+		{"known: USSD", "USSD", false},
+		{"known: IVR", "IVR", false},
+		{"unknown value rejected", "SMART_FRIDGE", true},
+		// Matching is case-insensitive (see TestValidate_EndpointTypeCaseInsensitiveNormalization
+		// for the normalization assertion) — mixed case of a KNOWN value is accepted.
+		{"mixed case of known value accepted", "mobile_app", false},
+		{"unknown value still rejected regardless of case", "smart_fridge", true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r := base
+			r.EndpointType = tt.endpointType
+			err := r.Validate()
+			if tt.wantErr && err == nil {
+				t.Errorf("endpoint_type %q: expected validation error, got nil", tt.endpointType)
+			}
+			if !tt.wantErr && err != nil {
+				t.Errorf("endpoint_type %q: unexpected validation error: %v", tt.endpointType, err)
+			}
+			if tt.wantErr {
+				var ve *ValidationError
+				if !isValidationError(err, &ve) {
+					t.Fatalf("endpoint_type %q: expected *ValidationError, got %T", tt.endpointType, err)
+				}
+				if ve.Field != "endpoint_type" {
+					t.Errorf("endpoint_type %q: expected error field %q, got %q", tt.endpointType, "endpoint_type", ve.Field)
+				}
+			}
+		})
+	}
+}
+
+// isValidationError type-asserts err into a *ValidationError, storing it into
+// *out and reporting whether the assertion succeeded.
+func isValidationError(err error, out **ValidationError) bool {
+	ve, ok := err.(*ValidationError)
+	if ok {
+		*out = ve
+	}
+	return ok
+}
+
+func TestAnonymizeSignal_SignalIDUniqueAcrossCalls(t *testing.T) {
+	raw := RawData{ID: "1", Name: "Test", Account: "ACC", Amount: 100, Timestamp: "2026-01-01T00:00:00Z"}
+
+	seen := make(map[string]bool)
+	const n = 200
+	for i := 0; i < n; i++ {
+		sig := AnonymizeSignal(raw, "BNK", "salt", "pepper", 10000)
+		if sig.SignalID == "" {
+			t.Fatal("expected a non-empty signal_id")
+		}
+		if seen[sig.SignalID] {
+			t.Fatalf("signal_id collision across calls: %s", sig.SignalID)
+		}
+		seen[sig.SignalID] = true
+	}
+
+	// Not derived from PII: identical input, different national ID must not
+	// change the fact that every call still gets its own fresh signal_id
+	// (already covered above), and the identity mosaic (which IS derived
+	// from PII/config) must differ from the signal_id in shape/value.
+	sig := AnonymizeSignal(raw, "BNK", "salt", "pepper", 10000)
+	if sig.SignalID == sig.IdentityMosaic {
+		t.Error("signal_id must not equal identity_mosaic")
+	}
+}
+
+func TestAnonymizeSignal_SignalIDDerivedFromCallerRef(t *testing.T) {
+	// signal_id must be DERIVED from a caller-supplied transaction_ref, never
+	// the raw value itself — the raw ref is forwarded to an external vendor
+	// with no hashing anywhere else in the payload, and a format check alone
+	// (transactionRefPattern) cannot distinguish an opaque reference from a
+	// bare BVN/NIN, NUBAN account number, phone number, or a name with
+	// separators stripped.
+	ref := "core-banking-ref-88421"
+	raw := RawData{ID: "1", Name: "Test", Account: "ACC", Amount: 100, Timestamp: "2026-01-01T00:00:00Z",
+		TransactionRef: ref}
+
+	sig := AnonymizeSignal(raw, "BNK", "salt", "pepper", 10000)
+	if sig.SignalID == ref {
+		t.Fatalf("signal_id must never equal the raw transaction_ref, got %q", sig.SignalID)
+	}
+	if sig.SignalID == "" {
+		t.Fatal("expected a non-empty derived signal_id")
+	}
+
+	// Determinism: the same ref (and same salt) must derive the same
+	// signal_id every time, so it still works as an idempotency key / join
+	// key the bank can recompute.
+	sigAgain := AnonymizeSignal(raw, "BNK", "salt", "pepper", 10000)
+	if sig.SignalID != sigAgain.SignalID {
+		t.Errorf("expected deterministic signal_id for the same ref, got %q and %q", sig.SignalID, sigAgain.SignalID)
+	}
+
+	// A different bank salt must change the derived signal_id — the vendor,
+	// without BANK_SALT, must not be able to invert or correlate it.
+	sigOtherSalt := AnonymizeSignal(raw, "BNK", "other_salt", "pepper", 10000)
+	if sigOtherSalt.SignalID == sig.SignalID {
+		t.Error("different bank salt must change the derived signal_id")
+	}
+
+	// Whitespace-only ref is treated as absent, same as the other optional
+	// string fields' "must be usable, not just present" validation style.
+	rawBlank := raw
+	rawBlank.TransactionRef = "   "
+	sigBlank := AnonymizeSignal(rawBlank, "BNK", "salt", "pepper", 10000)
+	if sigBlank.SignalID == "" || sigBlank.SignalID == "   " {
+		t.Errorf("blank transaction_ref should fall back to a generated signal_id, got %q", sigBlank.SignalID)
+	}
+
+	// Two calls with no ref supplied must not collide with each other or
+	// with the derived signal_id above.
+	rawNoRef := raw
+	rawNoRef.TransactionRef = ""
+	sigA := AnonymizeSignal(rawNoRef, "BNK", "salt", "pepper", 10000)
+	sigB := AnonymizeSignal(rawNoRef, "BNK", "salt", "pepper", 10000)
+	if sigA.SignalID == sigB.SignalID {
+		t.Error("generated signal_id must differ across calls even with identical input")
+	}
+	if sigA.SignalID == sig.SignalID || sigB.SignalID == sig.SignalID {
+		t.Error("generated signal_id must not collide with a derived signal_id")
+	}
+}
+
+func TestAnonymizeSignal_SignalIDDerivationHidesStructuredPII(t *testing.T) {
+	// transactionRefPattern only screens obviously malformed input; these
+	// values all pass that regex cleanly despite being structured PII
+	// (BVN/NIN-shaped, NUBAN-account-shaped, phone-shaped, name-shaped).
+	// The derivation step, not the regex, is what must keep them from
+	// reaching the vendor verbatim.
+	piiShapedRefs := []struct {
+		name string
+		ref  string
+	}{
+		{"BVN-shaped (11 digits)", "22345678901"},
+		{"NUBAN account-shaped (10 digits)", "0123456789"},
+		{"phone-shaped", "2348012345678"},
+		{"name with space removed", "NgoziAdeyemi"},
+		{"name with underscore", "Ngozi_Adeyemi"},
+	}
+
+	for _, tt := range piiShapedRefs {
+		t.Run(tt.name, func(t *testing.T) {
+			raw := RawData{ID: "1", Name: "Test", Account: "ACC", Amount: 100, Timestamp: "2026-01-01T00:00:00Z",
+				TransactionRef: tt.ref}
+
+			// Confirm the harness assumption: this value passes the input
+			// hygiene regex, so the derivation step is the only thing
+			// standing between it and the vendor.
+			if !transactionRefPattern.MatchString(tt.ref) {
+				t.Fatalf("test setup error: %q was expected to match transactionRefPattern", tt.ref)
+			}
+
+			sig := AnonymizeSignal(raw, "BNK", "salt", "pepper", 10000)
+			if sig.SignalID == tt.ref {
+				t.Errorf("PII-shaped transaction_ref %q must be transformed, not passed through, got signal_id %q", tt.ref, sig.SignalID)
+			}
+			if strings.Contains(sig.SignalID, tt.ref) {
+				t.Errorf("derived signal_id %q must not contain the raw ref %q", sig.SignalID, tt.ref)
+			}
+		})
+	}
+}
+
+func TestAnonymizeSignal_SignalIDDerivationIsExactBytesNotNormalized(t *testing.T) {
+	// signal_id must be derived from the EXACT trimmed bytes of
+	// transaction_ref, not NormalizeID's uppercased/separator-stripped
+	// form. NormalizeID exists to converge inconsistently-formatted
+	// national IDs onto one mosaic — the opposite of what an opaque
+	// caller reference needs: two distinct references must never collide
+	// onto the same signal_id, so case and punctuation must be
+	// significant. Without this, "TX-001", "TX.001", "tx001" and "TX001"
+	// would all derive the same signal_id despite being (potentially)
+	// four different transactions, breaking both the out-of-band join and
+	// idempotency in the wrong direction.
+	mkSig := func(ref string) AnonymizedSignal {
+		raw := RawData{ID: "1", Name: "Test", Account: "ACC", Amount: 100, Timestamp: "2026-01-01T00:00:00Z",
+			TransactionRef: ref}
+		return AnonymizeSignal(raw, "BNK", "salt", "pepper", 10000)
+	}
+
+	base := mkSig("TX001")
+
+	tests := []struct {
+		name string
+		ref  string
+	}{
+		{"differs only by case", "tx001"},
+		{"differs only by a dash", "TX-001"},
+		{"differs only by a dot", "TX.001"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			sig := mkSig(tt.ref)
+			if sig.SignalID == base.SignalID {
+				t.Errorf("transaction_ref %q must derive a DIFFERENT signal_id than %q, both got %q", tt.ref, "TX001", sig.SignalID)
+			}
+		})
+	}
+
+	// Sanity check the derivation formula directly: exact trimmed bytes,
+	// not NormalizeID(ref).
+	want := HMACHash("salt", "v2|sigid|TX001")
+	if base.SignalID != want {
+		t.Errorf("expected signal_id derived from exact bytes %q, got %q, want %q", "TX001", base.SignalID, want)
+	}
+}
+
+func TestNewSignalID(t *testing.T) {
+	a := NewSignalID()
+	b := NewSignalID()
+	if a == b {
+		t.Fatal("NewSignalID must not repeat across calls")
+	}
+	// UUIDv4 shape: 8-4-4-4-12 hex, version nibble 4, variant nibble 8-b.
+	if len(a) != 36 {
+		t.Fatalf("expected 36-char UUID-shaped id, got %d: %q", len(a), a)
+	}
+	if a[14] != '4' {
+		t.Errorf("expected UUID version nibble '4', got %q in %q", a[14], a)
+	}
+	if a[19] != '8' && a[19] != '9' && a[19] != 'a' && a[19] != 'b' {
+		t.Errorf("expected UUID variant nibble in [89ab], got %q in %q", a[19], a)
+	}
+}
+
+func TestAnonymizeSignal_FeatureVersionEmitted(t *testing.T) {
+	raw := RawData{ID: "1", Name: "Test", Account: "ACC", Amount: 100, Timestamp: "2026-01-01T00:00:00Z"}
+	sig := AnonymizeSignal(raw, "BNK", "salt", "pepper", 10000)
+
+	if sig.FeatureVersion != FeatureVersion {
+		t.Errorf("expected feature_version %d, got %d", FeatureVersion, sig.FeatureVersion)
+	}
+	if sig.FeatureVersion == 0 {
+		t.Error("feature_version must be a positive, explicit version, not the zero value")
+	}
+}
+
+func TestValidate_TransactionRefShape(t *testing.T) {
+	base := RawData{ID: "1", Name: "Test", Account: "ACC", Amount: 100, Timestamp: "2026-01-15T14:07:33Z"}
+
+	tests := []struct {
+		name    string
+		ref     string
+		wantErr bool
+	}{
+		{"absent is allowed", "", false},
+		{"whitespace-only treated as absent", "   ", false},
+		{"valid opaque ref", "core-banking-ref-88421", false},
+		{"valid uuid-shaped ref", "3fa85f64-5717-4562-b3fc-2c963f66afa6", false},
+		{"valid with underscore", "TXN_2026_08421", false},
+		{"over-long ref rejected", strings.Repeat("a", 65), true},
+		{"max-length ref allowed", strings.Repeat("a", 64), false},
+		{"ref with internal spaces rejected", "core banking ref", true},
+		{"ref with punctuation rejected", "ref#88421!", true},
+		{"ref with a dot rejected", "txn.88421", true},
+		{"name-like ref rejected", "Ngozi Adeyemi", true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r := base
+			r.TransactionRef = tt.ref
+			err := r.Validate()
+			if tt.wantErr && err == nil {
+				t.Errorf("transaction_ref %q: expected validation error, got nil", tt.ref)
+			}
+			if !tt.wantErr && err != nil {
+				t.Errorf("transaction_ref %q: unexpected validation error: %v", tt.ref, err)
+			}
+			if tt.wantErr {
+				ve, ok := err.(*ValidationError)
+				if !ok {
+					t.Fatalf("transaction_ref %q: expected *ValidationError, got %T", tt.ref, err)
+				}
+				if ve.Field != "transaction_ref" {
+					t.Errorf("transaction_ref %q: expected error field %q, got %q", tt.ref, "transaction_ref", ve.Field)
+				}
+			}
+		})
+	}
+}
+
+func TestValidate_SignalTypeCaseInsensitiveNormalization(t *testing.T) {
+	base := RawData{ID: "1", Name: "Test", Account: "ACC", Amount: 100, Timestamp: "2026-01-15T14:07:33Z"}
+
+	tests := []struct {
+		input string
+		want  string
+	}{
+		{"transaction", "transaction"},
+		{"Transaction", "transaction"},
+		{"TRANSACTION", "transaction"},
+		{"LoGiN", "login"},
+		{"TRANSFER", "transfer"},
+		{"Authentication", "authentication"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.input, func(t *testing.T) {
+			r := base
+			r.SignalType = tt.input
+			if err := r.Validate(); err != nil {
+				t.Fatalf("signal_type %q: unexpected validation error: %v", tt.input, err)
+			}
+			if r.SignalType != tt.want {
+				t.Errorf("signal_type %q: expected Validate to normalize to %q, got %q", tt.input, tt.want, r.SignalType)
+			}
+		})
+	}
+}
+
+func TestValidate_EndpointTypeCaseInsensitiveNormalization(t *testing.T) {
+	base := RawData{ID: "1", Name: "Test", Account: "ACC", Amount: 100, Timestamp: "2026-01-15T14:07:33Z"}
+
+	tests := []struct {
+		input string
+		want  string
+	}{
+		{"MOBILE_APP", "MOBILE_APP"},
+		{"mobile_app", "MOBILE_APP"},
+		{"Mobile_App", "MOBILE_APP"},
+		{"ussd", "USSD"},
+		{"USSD", "USSD"},
+		{"ivr", "IVR"},
+		{"Ivr", "IVR"},
+		{"atm", "ATM"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.input, func(t *testing.T) {
+			r := base
+			r.EndpointType = tt.input
+			if err := r.Validate(); err != nil {
+				t.Fatalf("endpoint_type %q: unexpected validation error: %v", tt.input, err)
+			}
+			if r.EndpointType != tt.want {
+				t.Errorf("endpoint_type %q: expected Validate to normalize to %q, got %q", tt.input, tt.want, r.EndpointType)
+			}
+		})
+	}
+}
+
+func TestAnonymizeSignal_EmitsCanonicalSignalAndEndpointType(t *testing.T) {
+	// End-to-end: Validate (as adapters.ProcessInboundRequest calls it) then
+	// AnonymizeSignal must emit the canonical spelling regardless of how the
+	// caller cased signal_type/endpoint_type, so the vendor always sees one
+	// consistent spelling.
+	raw := RawData{ID: "1", Name: "Test", Account: "ACC", Amount: 100, Timestamp: "2026-01-01T00:00:00Z",
+		SignalType: "TrAnSaCtIoN", EndpointType: "ussd"}
+
+	if err := raw.Validate(); err != nil {
+		t.Fatalf("unexpected validation error: %v", err)
+	}
+
+	sig := AnonymizeSignal(raw, "BNK", "salt", "pepper", 10000)
+	if sig.SignalType != "transaction" {
+		t.Errorf("expected canonical signal_type %q, got %q", "transaction", sig.SignalType)
+	}
+	if sig.Metadata["endpoint_type"] != "USSD" {
+		t.Errorf("expected canonical endpoint_type %q, got %v", "USSD", sig.Metadata["endpoint_type"])
 	}
 }

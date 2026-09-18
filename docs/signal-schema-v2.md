@@ -11,11 +11,13 @@ new mosaic scopes.
 
 ```json
 {
+  "signal_id": "3fa85f64-5717-4562-b3fc-2c963f66afa6",
   "institution_id": "BNK_EXAMPLE",
   "signal_type": "transaction",
   "identity_mosaic": "d433f5d2a3aedcb9…64 hex chars",
   "mosaic_scope": "global",
   "mosaic_version": 2,
+  "feature_version": 1,
   "timestamp": "2026-01-15T14:00:00Z",
   "metadata": {
     "amount_tier": "TIER_3",
@@ -47,13 +49,122 @@ new mosaic scopes.
 | Cross-bank matchability | Broken (bank salt in every mosaic) | Works for `mosaic_scope: "global"` |
 | `mosaic_scope` | absent | **new, always present**: `"global"` or `"local"` |
 | `mosaic_version` | absent | **new, always present**: `2` |
+| `signal_id` | absent | **new, always present**: unique per event, derived (not echoed) from an optional `transaction_ref` — see below |
+| `feature_version` | absent | **new, always present**: see below |
+| `signal_type` / `endpoint_type` | free-form, unvalidated | **BREAKING**: closed allowlist, case-insensitive match, canonical spelling emitted — see below |
 | `destination_mosaic_scope` | absent | new, present iff `destination_mosaic` is |
 | Timestamp | bucketed, timezone lost | RFC 3339, normalized to UTC, 15-min bucket |
 | `location_zone` | always a geohash (0,0 fabricated when unknown) | geohash-5 or `ZONE_UNKNOWN` |
 
+## `signal_id` — per-event correlation ID (BREAKING CHANGE for `transaction_ref` callers)
+
+`identity_mosaic` is stable per *person* across every transaction, so on its
+own it cannot join a single event to anything. `signal_id` is unique per
+*event*, derived one of two ways:
+
+- **No `transaction_ref` supplied:** `signal_id` is a randomly generated
+  UUIDv4 (`crypto/rand`), never derived from PII.
+- **`transaction_ref` supplied** (optional inbound field on the request to
+  `/process`; blank/whitespace-only is treated as absent): `signal_id` is
+  **derived**, never the raw value —
+
+  `signal_id = HMAC-SHA256(key = BANK_SALT, msg = "v2|sigid|" + trimmed_transaction_ref)`
+
+  using the same `HMACHash` helper as the mosaics above, over the **exact
+  trimmed bytes** of `transaction_ref` — deliberately **not** the
+  `NormalizeID` form used for national IDs elsewhere in this document.
+  `NormalizeID` uppercases and strips `-`/`.` so inconsistently-formatted
+  national IDs converge onto one mosaic; a caller-supplied transaction
+  reference needs the opposite property, since two distinct references must
+  never collide onto the same `signal_id`. **`transaction_ref` is therefore
+  case-sensitive and punctuation-sensitive: `"TX-001"`, `"TX.001"`,
+  `"tx001"`, and `"TX001"` are four different references and derive four
+  different `signal_id` values.**
+
+  **The raw `transaction_ref` is never forwarded to the vendor.** This
+  matters because `transaction_ref` accepts a fairly permissive opaque-token
+  shape (see below) that a bare BVN/NIN, NUBAN account number, or phone
+  number can satisfy just as easily as a real reference ID — deriving
+  `signal_id` via HMAC keeps that value from ever reaching the vendor in
+  recoverable form, while staying **deterministic**: the same exact
+  `transaction_ref` always produces the same `signal_id` (so it still works
+  as an idempotency key), and the originating bank — which holds
+  `BANK_SALT` — can recompute the same HMAC over its own transaction
+  references (byte-for-byte, no normalization) to join an out-of-band
+  vendor result back to a transaction. The vendor, without `BANK_SALT`,
+  cannot invert it or correlate references across institutions.
+
+Consumers that need to correlate a downstream result back to a specific
+transaction — e.g. a fraud-scoring result returned out-of-band by an
+external system — should key that join on `signal_id` (recomputed from their
+own `transaction_ref`, if they supplied one), not `identity_mosaic`.
+
+### `transaction_ref` input shape (BREAKING CHANGE)
+
+The inbound `transaction_ref` field must match `^[A-Za-z0-9_-]{1,64}$`
+(alphanumeric, underscore, hyphen; 1–64 characters after trimming
+whitespace). **This is a breaking change**: a `transaction_ref` value that
+was previously accepted unvalidated — free text, punctuation, embedded
+spaces — now gets `400` from `/process`. Note this shape check is input
+hygiene, not the PII boundary: the boundary is that `signal_id` is always
+derived from `transaction_ref` (see above), never the raw value forwarded
+as-is.
+
+**`transaction_ref` is case-sensitive and punctuation-sensitive.** It is
+hashed as exact trimmed bytes (not normalized like national IDs elsewhere
+in this document), so `"TX-001"`, `"TX.001"`, `"tx001"`, and `"TX001"` are
+four distinct references that derive four distinct `signal_id` values.
+Integrators should pick one consistent format per reference and send it
+exactly that way every time — do not rely on the gateway to reconcile
+formatting variants of what a human would consider "the same" reference.
+
+## `feature_version` — versioned feature-shape contract
+
+`feature_version` (currently `1`) identifies the shape of the derived,
+model-facing fields inside `metadata`: `amount_tier` boundaries (500 / 2500 /
+10000), the 15-minute timestamp bucket width, and the geohash precision (5)
+behind `location_zone`. A consumer whose model was fit to a specific
+`feature_version`'s boundaries must detect and handle a version bump before
+trusting new signals — these boundaries can change independently of
+`mosaic_version`, since they don't affect mosaic derivation at all.
+
 v1 and v2 mosaics never collide meaningfully — the derivations differ — so
 during migration the Hub should partition matching by `mosaic_version`
 (treat absent as version 1).
+
+## `signal_type` / `endpoint_type` — closed allowlists (BREAKING CHANGE)
+
+**Breaking change:** the gateway now hard-rejects inbound requests whose
+`signal_type` or `endpoint_type` is not on a fixed allowlist, returning
+`400` from `/process` instead of accepting the signal. A core banking system
+sending a value outside these lists — including a value the gateway
+previously forwarded unquestioned — will start seeing `400`s from this
+release onward. This exists to keep the pipeline scoped to fraud-relevant
+signals rather than silently widening into general behavioural egress to a
+commercial vendor; it is enforced in `RawData.Validate()`.
+
+- **`signal_type` allowlist** (canonical spelling is lowercase):
+  `transaction`, `login`, `transfer`, `authentication`.
+- **`endpoint_type` allowlist** (canonical spelling is uppercase):
+  `MOBILE_APP`, `ATM`, `POS`, `WEB`, `BRANCH`, `API`, `USSD`, `IVR`.
+  `USSD` and `IVR` were added specifically for this deployment's market —
+  USSD banking and IVR/call-centre channels are common where BVN/NIN
+  identifiers apply — rather than carried over from prior repo usage.
+- **Matching is case-insensitive.** `"Transaction"`, `"transaction"`, and
+  `"TRANSACTION"` are all accepted as the same value; likewise
+  `"mobile_app"` and `"MOBILE_APP"`.
+- **The emitted value is normalized to canonical spelling**, not passed
+  through as typed. Whatever casing the caller sends, the outgoing signal's
+  `signal_type` and `metadata.endpoint_type` always use the allowlist's own
+  spelling (lowercase for `signal_type`, uppercase for `endpoint_type`), so
+  the vendor sees one consistent spelling regardless of caller casing.
+- An empty `signal_type` is still accepted and defaults to `"transaction"`,
+  unchanged from prior behavior. `endpoint_type` remains optional; when
+  absent, `metadata.endpoint_type` is simply omitted.
+
+Both allowlists are package-level (`processor.ValidSignalTypes`,
+`processor.ValidEndpointTypes`) and intended to be extended deliberately as
+new legitimate values are identified.
 
 ## Mosaic derivation (gateway-side, for reference)
 

@@ -68,21 +68,31 @@ own it cannot join a single event to anything. `signal_id` is unique per
   `/process`; blank/whitespace-only is treated as absent): `signal_id` is
   **derived**, never the raw value —
 
-  `signal_id = HMAC-SHA256(key = BANK_SALT, msg = "v2|sigid|" + normalized_transaction_ref)`
+  `signal_id = HMAC-SHA256(key = BANK_SALT, msg = "v2|sigid|" + trimmed_transaction_ref)`
 
-  using the same `HMACHash`/`NormalizeID` machinery as the mosaics above.
+  using the same `HMACHash` helper as the mosaics above, over the **exact
+  trimmed bytes** of `transaction_ref` — deliberately **not** the
+  `NormalizeID` form used for national IDs elsewhere in this document.
+  `NormalizeID` uppercases and strips `-`/`.` so inconsistently-formatted
+  national IDs converge onto one mosaic; a caller-supplied transaction
+  reference needs the opposite property, since two distinct references must
+  never collide onto the same `signal_id`. **`transaction_ref` is therefore
+  case-sensitive and punctuation-sensitive: `"TX-001"`, `"TX.001"`,
+  `"tx001"`, and `"TX001"` are four different references and derive four
+  different `signal_id` values.**
+
   **The raw `transaction_ref` is never forwarded to the vendor.** This
   matters because `transaction_ref` accepts a fairly permissive opaque-token
   shape (see below) that a bare BVN/NIN, NUBAN account number, or phone
   number can satisfy just as easily as a real reference ID — deriving
   `signal_id` via HMAC keeps that value from ever reaching the vendor in
-  recoverable form, while staying **deterministic**: the same
+  recoverable form, while staying **deterministic**: the same exact
   `transaction_ref` always produces the same `signal_id` (so it still works
   as an idempotency key), and the originating bank — which holds
   `BANK_SALT` — can recompute the same HMAC over its own transaction
-  references to join an out-of-band vendor result back to a transaction.
-  The vendor, without `BANK_SALT`, cannot invert it or correlate references
-  across institutions.
+  references (byte-for-byte, no normalization) to join an out-of-band
+  vendor result back to a transaction. The vendor, without `BANK_SALT`,
+  cannot invert it or correlate references across institutions.
 
 Consumers that need to correlate a downstream result back to a specific
 transaction — e.g. a fraud-scoring result returned out-of-band by an
@@ -99,6 +109,14 @@ spaces — now gets `400` from `/process`. Note this shape check is input
 hygiene, not the PII boundary: the boundary is that `signal_id` is always
 derived from `transaction_ref` (see above), never the raw value forwarded
 as-is.
+
+**`transaction_ref` is case-sensitive and punctuation-sensitive.** It is
+hashed as exact trimmed bytes (not normalized like national IDs elsewhere
+in this document), so `"TX-001"`, `"TX.001"`, `"tx001"`, and `"TX001"` are
+four distinct references that derive four distinct `signal_id` values.
+Integrators should pick one consistent format per reference and send it
+exactly that way every time — do not rely on the gateway to reconcile
+formatting variants of what a human would consider "the same" reference.
 
 ## `feature_version` — versioned feature-shape contract
 

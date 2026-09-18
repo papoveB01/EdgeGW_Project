@@ -212,12 +212,21 @@ type AnonymizedSignal struct {
 	// IdentityMosaic for that). It is the join key the bank uses to match
 	// out-of-band vendor results back to this signal. When RawData.
 	// TransactionRef is supplied, SignalID is HMACHash(bankSalt, "v2|sigid|"
-	// + NormalizeID(ref)) — deterministic (same ref -> same SignalID, so it
-	// still works as an idempotency key) but never the raw ref itself, so a
-	// caller that puts a real identifier in TransactionRef never ships it to
-	// the vendor. The bank recomputes the same HMAC over its own references
-	// to join results back; the vendor, without BANK_SALT, cannot invert it.
-	// When TransactionRef is absent, SignalID is a random UUIDv4 instead.
+	// + strings.TrimSpace(ref)) over the EXACT trimmed bytes of the
+	// reference — deliberately NOT NormalizeID, which uppercases and strips
+	// '-'/'.'  NormalizeID exists to converge inconsistently-formatted
+	// national IDs onto one value; a caller-supplied transaction reference
+	// needs the opposite property; two distinct references must never
+	// collide, so "TX-001", "TX.001", "tx001" and "TX001" are all treated
+	// as different references and derive different SignalIDs.
+	// TransactionRef is case-sensitive and punctuation-sensitive as a
+	// result. This stays deterministic (same ref -> same SignalID, so it
+	// still works as an idempotency key) but never exposes the raw ref
+	// itself, so a caller that puts a real identifier in TransactionRef
+	// never ships it to the vendor. The bank recomputes the same HMAC over
+	// its own references to join results back; the vendor, without
+	// BANK_SALT, cannot invert it. When TransactionRef is absent, SignalID
+	// is a random UUIDv4 instead.
 	SignalID       string `json:"signal_id"`
 	InstitutionID  string `json:"institution_id"`
 	SignalType     string `json:"signal_type"`
@@ -439,9 +448,17 @@ func AnonymizeSignal(rawPii RawData, institutionID string, salt string, pepper s
 	// nothing recoverable ever reaches the vendor, who never holds
 	// BANK_SALT. When absent, generate a random one instead — still never
 	// derived from PII.
+	//
+	// Deliberately NOT NormalizeID here: NormalizeID uppercases and strips
+	// '-'/'.' so differently-formatted national IDs converge onto one
+	// mosaic — exactly the wrong property for an opaque caller reference,
+	// where "TX-001", "TX.001", "tx001" and "TX001" must be treated as
+	// distinct references (they could be four different transactions) and
+	// must not collide onto the same signal_id. Hash the trimmed raw bytes
+	// instead — TransactionRef is case-sensitive and punctuation-sensitive.
 	var signalID string
 	if ref := strings.TrimSpace(rawPii.TransactionRef); ref != "" {
-		signalID = HMACHash(salt, "v2|sigid|"+NormalizeID(ref))
+		signalID = HMACHash(salt, "v2|sigid|"+ref)
 	} else {
 		signalID = NewSignalID()
 	}

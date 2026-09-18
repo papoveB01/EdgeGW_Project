@@ -520,6 +520,50 @@ func TestAnonymizeSignal_SignalIDDerivationHidesStructuredPII(t *testing.T) {
 	}
 }
 
+func TestAnonymizeSignal_SignalIDDerivationIsExactBytesNotNormalized(t *testing.T) {
+	// signal_id must be derived from the EXACT trimmed bytes of
+	// transaction_ref, not NormalizeID's uppercased/separator-stripped
+	// form. NormalizeID exists to converge inconsistently-formatted
+	// national IDs onto one mosaic — the opposite of what an opaque
+	// caller reference needs: two distinct references must never collide
+	// onto the same signal_id, so case and punctuation must be
+	// significant. Without this, "TX-001", "TX.001", "tx001" and "TX001"
+	// would all derive the same signal_id despite being (potentially)
+	// four different transactions, breaking both the out-of-band join and
+	// idempotency in the wrong direction.
+	mkSig := func(ref string) AnonymizedSignal {
+		raw := RawData{ID: "1", Name: "Test", Account: "ACC", Amount: 100, Timestamp: "2026-01-01T00:00:00Z",
+			TransactionRef: ref}
+		return AnonymizeSignal(raw, "BNK", "salt", "pepper", 10000)
+	}
+
+	base := mkSig("TX001")
+
+	tests := []struct {
+		name string
+		ref  string
+	}{
+		{"differs only by case", "tx001"},
+		{"differs only by a dash", "TX-001"},
+		{"differs only by a dot", "TX.001"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			sig := mkSig(tt.ref)
+			if sig.SignalID == base.SignalID {
+				t.Errorf("transaction_ref %q must derive a DIFFERENT signal_id than %q, both got %q", tt.ref, "TX001", sig.SignalID)
+			}
+		})
+	}
+
+	// Sanity check the derivation formula directly: exact trimmed bytes,
+	// not NormalizeID(ref).
+	want := HMACHash("salt", "v2|sigid|TX001")
+	if base.SignalID != want {
+		t.Errorf("expected signal_id derived from exact bytes %q, got %q, want %q", "TX001", base.SignalID, want)
+	}
+}
+
 func TestNewSignalID(t *testing.T) {
 	a := NewSignalID()
 	b := NewSignalID()

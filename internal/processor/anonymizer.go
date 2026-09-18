@@ -295,7 +295,9 @@ type AnonymizedSignal struct {
 	// never ships it to the vendor. The bank recomputes the same HMAC over
 	// its own references to join results back; the vendor, without
 	// BANK_SALT, cannot invert it. When TransactionRef is absent, SignalID
-	// is a random UUIDv4 instead.
+	// is AnonymizeSignal's fallbackSignalID parameter verbatim — by
+	// convention a random UUIDv4 the caller generated with NewSignalID()
+	// (see that parameter's doc comment on AnonymizeSignal).
 	SignalID       string `json:"signal_id"`
 	InstitutionID  string `json:"institution_id"`
 	SignalType     string `json:"signal_type"`
@@ -465,40 +467,64 @@ func BucketTimestamp(ts string) string {
 // crypto/rand. It carries no information about the underlying transaction
 // or person — it is pure randomness, never derived from PII.
 //
-// On rand.Read failure this panics rather than returning an error. That is
-// a deliberate, scoped tradeoff, not an oversight:
-//   - rand.Read only fails when the OS's CSPRNG itself is broken (see the
-//     crypto/rand docs) — a condition under which continuing to serve any
-//     request is already unsound, not just this one field.
-//   - Threading a real error out of here would change AnonymizeSignal's
-//     signature (today a pure `(RawData, ...) AnonymizedSignal` function,
-//     by design per this repo's architecture notes) and every caller,
-//     including cmd/gateway/main.go's processTransaction — which is
-//     explicitly out of scope for this change beyond echoing signal_id in
-//     the response body.
+// It returns an error instead of panicking when rand.Read fails, so the
+// caller can turn a broken OS entropy source into an observable failure
+// (structured log + metric + a proper HTTP status) instead of a bare
+// connection reset. See cmd/gateway/main.go's processTransaction, which
+// calls this BEFORE AnonymizeSignal (only when RawData.TransactionRef is
+// absent) and handles a returned error with the same slog.Error + metric +
+// http.Error(500) pattern used by every other failure branch there.
 //
-// Known gap this leaves: net/http recovers panics per-connection with no
-// structured log or metric, so unlike every other failure path in
-// processTransaction (slog.Error + a proper http.Error status), a
-// rand.Read failure currently surfaces to the caller as a bare connection
-// reset. If this entropy-failure mode matters for this deployment's threat
-// model, the fix is to make AnonymizeSignal return an error and update
-// processTransaction (and its tests) to log and respond 500 — tracked as
-// follow-up work rather than folded into this change; see
-// https://github.com/papoveB01/EdgeGW_Project/issues/4.
-func NewSignalID() string {
+// AnonymizeSignal itself does not call this — see its doc comment for why:
+// generating the fallback ID here, in the caller, keeps AnonymizeSignal a
+// genuinely pure function of its inputs. Originally NewSignalID panicked on
+// failure and was called from inside AnonymizeSignal; that gap is what
+// https://github.com/papoveB01/EdgeGW_Project/issues/4 tracked and this
+// change closes.
+func NewSignalID() (string, error) {
+	return newSignalIDFrom(rand.Read)
+}
+
+// newSignalIDFrom is NewSignalID's implementation, parameterized on the
+// entropy source so tests can inject a failing one (e.g. a func literal
+// that always returns an error) to exercise the failure path
+// deterministically, without patching crypto/rand globally or resorting to
+// unsafe tricks. read must have crypto/rand.Read's signature.
+func newSignalIDFrom(read func([]byte) (int, error)) (string, error) {
 	var b [16]byte
-	if _, err := rand.Read(b[:]); err != nil {
-		panic("processor: failed to read random bytes for signal_id: " + err.Error())
+	if _, err := read(b[:]); err != nil {
+		return "", fmt.Errorf("processor: failed to read random bytes for signal_id: %w", err)
 	}
 	b[6] = (b[6] & 0x0f) | 0x40 // version 4
 	b[8] = (b[8] & 0x3f) | 0x80 // variant 10xx
-	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
+	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16]), nil
 }
 
-// AnonymizeSignal processes raw PII data into an anonymized signal.
-// Uses delimited field concatenation to prevent boundary collisions.
-func AnonymizeSignal(rawPii RawData, institutionID string, salt string, pepper string, keying string, reportingThreshold float64) AnonymizedSignal {
+// AnonymizeSignal processes raw PII data into an anonymized signal. It is a
+// pure function: for identical inputs (including fallbackSignalID) it
+// always produces an identical output, does no I/O, and never touches OS
+// entropy itself. Uses delimited field concatenation to prevent boundary
+// collisions.
+//
+// fallbackSignalID is used verbatim as the output SignalID only when
+// RawData.TransactionRef is absent (blank/whitespace-only counts as
+// absent) — when TransactionRef is supplied, fallbackSignalID is ignored
+// entirely and SignalID is deterministically derived from the reference
+// instead (see the SignalID field doc on AnonymizedSignal). The caller is
+// responsible for generating fallbackSignalID (normally via
+// processor.NewSignalID()) and for handling a crypto/rand failure BEFORE
+// calling AnonymizeSignal — that responsibility used to live inside this
+// function (NewSignalID was called directly from here), which made
+// AnonymizeSignal neither pure nor deterministic whenever TransactionRef
+// was absent, and made a broken OS entropy source panic deep inside a
+// "pure" function with no chance for the caller to turn it into a proper
+// HTTP error. Moving random-ID generation out to the caller (see
+// processTransaction in cmd/gateway/main.go) restores genuine purity here
+// and fixes that panic; see
+// https://github.com/papoveB01/EdgeGW_Project/issues/4. A caller with a
+// TransactionRef in hand may pass "" for fallbackSignalID, since it won't
+// be used.
+func AnonymizeSignal(rawPii RawData, institutionID string, salt string, pepper string, keying string, reportingThreshold float64, fallbackSignalID string) AnonymizedSignal {
 	// 1. Identity Mosaic (v3).
 	//
 	// With a canonical national ID (BVN/NIN), keying depends on the
@@ -568,7 +594,9 @@ func AnonymizeSignal(rawPii RawData, institutionID string, salt string, pepper s
 	// keeps the identifier the bank can recompute (same ref -> same
 	// signal_id, so it still works as an idempotency key), while ensuring
 	// nothing recoverable ever reaches the vendor, who never holds
-	// BANK_SALT. When absent, generate a random one instead — still never
+	// BANK_SALT. When absent, use the caller-supplied fallbackSignalID
+	// instead (see this function's doc comment for why the random
+	// generation itself happens in the caller, not here) — still never
 	// derived from PII.
 	//
 	// Deliberately NOT NormalizeID here: NormalizeID uppercases and strips
@@ -582,7 +610,7 @@ func AnonymizeSignal(rawPii RawData, institutionID string, salt string, pepper s
 	if ref := strings.TrimSpace(rawPii.TransactionRef); ref != "" {
 		signalID = HMACHash(salt, "v2|sigid|"+ref)
 	} else {
-		signalID = NewSignalID()
+		signalID = fallbackSignalID
 	}
 
 	// account_hash/device_id_hash/ip_hash use the same keyed-HMAC construction

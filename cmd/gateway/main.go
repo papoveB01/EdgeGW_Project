@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -479,6 +480,14 @@ func healthcheck() int {
 	return 0
 }
 
+// genSignalID is processor.NewSignalID by default. processTransaction calls
+// it (never processor.NewSignalID directly) so tests can inject a failing
+// entropy source and exercise the 500 path deterministically, without
+// patching crypto/rand globally or resorting to unsafe tricks - the same
+// swappable-function approach processor.newSignalIDFrom uses internally.
+// Production code must never reassign this.
+var genSignalID = processor.NewSignalID
+
 // processTransaction validates, anonymizes, and hands off one transaction.
 // With a spool: persist and return 202 Accepted (delivery is asynchronous).
 // Without: deliver synchronously via syncForward and return 200/502.
@@ -486,6 +495,15 @@ func healthcheck() int {
 // with bounded retry, standalone writes to the local sink. pepper is
 // additional key material for mosaic derivation, resolved once at startup
 // (see main) - it may be empty (see resolvePepper/validateStartup).
+//
+// AnonymizeSignal is a pure function and no longer generates the random
+// fallback signal_id itself (see its doc comment): when RawData.
+// TransactionRef is absent, this handler generates that ID via
+// genSignalID() BEFORE calling AnonymizeSignal, and handles a crypto/rand
+// failure the same way every other failure branch here does - slog.Error
+// with no PII, a distinct metric, and a proper 500 - instead of letting a
+// panic reach net/http's per-connection recover (see
+// https://github.com/papoveB01/EdgeGW_Project/issues/4).
 func processTransaction(sp *spool.Spool, syncForward func(ctx context.Context, signal processor.AnonymizedSignal) error, pepper string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		startTime := time.Now()
@@ -506,7 +524,26 @@ func processTransaction(sp *spool.Spool, syncForward func(ctx context.Context, s
 		cfg := config.Get()
 		salt := cfg.Local.BankSalt
 
-		anonymized := processor.AnonymizeSignal(*rawData, cfg.Hub.InstitutionID, salt, pepper, cfg.MosaicKeying, cfg.Local.ReportingThreshold)
+		// AnonymizeSignal needs a random fallback signal_id only when the
+		// caller didn't supply transaction_ref (blank/whitespace-only counts
+		// as absent, matching AnonymizeSignal's own check) - generate it
+		// here, up front, so a crypto/rand failure surfaces as a normal
+		// request failure rather than a panic inside a "pure" function.
+		var fallbackSignalID string
+		if strings.TrimSpace(rawData.TransactionRef) == "" {
+			id, err := genSignalID()
+			if err != nil {
+				// No PII in this log line - err is a wrapped crypto/rand
+				// failure with no request data in it.
+				slog.Error("Failed to generate signal_id", "error", err)
+				adapters.RecordMetric("signal_id_generation_failures", 1)
+				http.Error(w, "Failed to generate signal_id", http.StatusInternalServerError)
+				return
+			}
+			fallbackSignalID = id
+		}
+
+		anonymized := processor.AnonymizeSignal(*rawData, cfg.Hub.InstitutionID, salt, pepper, cfg.MosaicKeying, cfg.Local.ReportingThreshold, fallbackSignalID)
 
 		if sp != nil {
 			payload, err := json.Marshal(anonymized)

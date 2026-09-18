@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -9,6 +10,7 @@ import (
 
 	"github.com/papoveB01/EdgeGW_Project/internal/config"
 	"github.com/papoveB01/EdgeGW_Project/internal/processor"
+	"github.com/papoveB01/EdgeGW_Project/internal/spool"
 )
 
 func TestValidateStartup_StandaloneStartsWithoutPepperOrDestination(t *testing.T) {
@@ -381,6 +383,191 @@ func TestProcessTransaction_RegionalKeyingEmitsMosaicKeyedByPepperAlone(t *testi
 	}
 	if captured.MosaicScope != processor.ScopeRegional {
 		t.Errorf("expected regional scope, got %q", captured.MosaicScope)
+	}
+}
+
+// withFailingSignalID replaces the package-level genSignalID (normally
+// processor.NewSignalID) with a func that always fails, for the duration of
+// the calling test, and restores it via t.Cleanup. This is how the
+// entropy-failure path is exercised end to end through processTransaction
+// without needing the OS's real CSPRNG to actually break - see genSignalID's
+// doc comment.
+func withFailingSignalID(t *testing.T, err error) {
+	t.Helper()
+	original := genSignalID
+	genSignalID = func() (string, error) { return "", err }
+	t.Cleanup(func() { genSignalID = original })
+}
+
+// withPanicIfCalledSignalID replaces genSignalID with a func that fails the
+// test immediately if invoked, so a test can assert that a code path never
+// even attempts to generate a fallback signal_id (e.g. because
+// transaction_ref was supplied).
+func withPanicIfCalledSignalID(t *testing.T) {
+	t.Helper()
+	original := genSignalID
+	genSignalID = func() (string, error) {
+		t.Fatal("genSignalID must not be called when transaction_ref is supplied")
+		return "", nil
+	}
+	t.Cleanup(func() { genSignalID = original })
+}
+
+// TestProcessTransaction_SignalIDGenerationFailureReturns500Sync is the
+// regression test for issue #4: NewSignalID/genSignalID failing (a broken OS
+// entropy source) must not panic through to net/http's per-connection
+// recover (a bare connection reset, no log line, no metric). It must instead
+// be handled exactly like every other failure branch in processTransaction:
+// slog.Error with no PII, a distinct metric via adapters.RecordMetric, and a
+// proper 500 with a body. Exercises the synchronous (sp == nil) path.
+func TestProcessTransaction_SignalIDGenerationFailureReturns500Sync(t *testing.T) {
+	t.Setenv("CONFIG_PATH", "/nonexistent/gateway.json")
+	t.Setenv("GATEWAY_MODE", "standalone")
+	t.Setenv("MOSAIC_KEYING", "")
+	t.Setenv("INSTITUTION_ID", "BANK_A")
+	t.Setenv("BANK_SALT", "a_sufficiently_long_bank_salt_value")
+	t.Setenv("REGIONAL_PEPPER", "")
+	t.Setenv("MOSAIC_PEPPER", "")
+	t.Cleanup(func() { config.Reload() })
+	config.Reload()
+
+	withFailingSignalID(t, errors.New("simulated CSPRNG failure"))
+
+	before := metricValue(t, "signal_id_generation_failures")
+
+	syncForwardCalled := false
+	syncForward := func(_ context.Context, _ processor.AnonymizedSignal) error {
+		syncForwardCalled = true
+		return nil
+	}
+	handler := processTransaction(nil, syncForward, "")
+
+	// No transaction_ref: this is the only path that needs a generated
+	// fallback signal_id, so this is the only path that can observe a
+	// crypto/rand failure.
+	body := `{
+		"id": "CUST-001",
+		"name": "John Doe",
+		"national_id": "22345678901",
+		"account": "ACC-1234567890",
+		"amount": 950.00,
+		"timestamp": "2026-01-15T14:07:33Z"
+	}`
+	req := httptest.NewRequest(http.MethodPost, "/process", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	handler(w, req)
+
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("expected 500, got %d: %s", w.Code, w.Body.String())
+	}
+	if w.Body.Len() == 0 {
+		t.Error("expected a non-empty error body, matching every other failure branch here")
+	}
+	if syncForwardCalled {
+		t.Error("syncForward must not be called when signal_id generation fails - nothing should be delivered")
+	}
+	if got := metricValue(t, "signal_id_generation_failures"); got != before+1 {
+		t.Errorf("expected signal_id_generation_failures to increment by 1, got %d -> %d", before, got)
+	}
+}
+
+// TestProcessTransaction_SignalIDGenerationFailureReturns500Async is the
+// spool-mode (sp != nil) companion to the sync test above - CLAUDE.md notes
+// "Both modes must stay in sync when changing response shape or metrics",
+// so both need direct coverage of this failure path.
+func TestProcessTransaction_SignalIDGenerationFailureReturns500Async(t *testing.T) {
+	t.Setenv("CONFIG_PATH", "/nonexistent/gateway.json")
+	t.Setenv("GATEWAY_MODE", "standalone")
+	t.Setenv("MOSAIC_KEYING", "")
+	t.Setenv("INSTITUTION_ID", "BANK_A")
+	t.Setenv("BANK_SALT", "a_sufficiently_long_bank_salt_value")
+	t.Setenv("REGIONAL_PEPPER", "")
+	t.Setenv("MOSAIC_PEPPER", "")
+	t.Cleanup(func() { config.Reload() })
+	config.Reload()
+
+	withFailingSignalID(t, errors.New("simulated CSPRNG failure"))
+
+	before := metricValue(t, "signal_id_generation_failures")
+
+	sp, err := spool.New(t.TempDir(), 10, func(context.Context, []byte) error { return nil }, func(error) bool { return false }, spool.Hooks{})
+	if err != nil {
+		t.Fatalf("spool.New: %v", err)
+	}
+
+	handler := processTransaction(sp, func(context.Context, processor.AnonymizedSignal) error { return nil }, "")
+
+	body := `{
+		"id": "CUST-001",
+		"name": "John Doe",
+		"national_id": "22345678901",
+		"account": "ACC-1234567890",
+		"amount": 950.00,
+		"timestamp": "2026-01-15T14:07:33Z"
+	}`
+	req := httptest.NewRequest(http.MethodPost, "/process", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	handler(w, req)
+
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("expected 500, got %d: %s", w.Code, w.Body.String())
+	}
+	if sp.Depth() != 0 {
+		t.Errorf("expected nothing enqueued when signal_id generation fails, spool depth = %d", sp.Depth())
+	}
+	if got := metricValue(t, "signal_id_generation_failures"); got != before+1 {
+		t.Errorf("expected signal_id_generation_failures to increment by 1, got %d -> %d", before, got)
+	}
+}
+
+// TestProcessTransaction_TransactionRefSuppliedSkipsSignalIDGeneration
+// confirms genSignalID is only invoked when it's actually needed: a request
+// with transaction_ref set derives signal_id deterministically and must
+// never touch OS entropy at all.
+func TestProcessTransaction_TransactionRefSuppliedSkipsSignalIDGeneration(t *testing.T) {
+	t.Setenv("CONFIG_PATH", "/nonexistent/gateway.json")
+	t.Setenv("GATEWAY_MODE", "standalone")
+	t.Setenv("MOSAIC_KEYING", "")
+	t.Setenv("INSTITUTION_ID", "BANK_A")
+	t.Setenv("BANK_SALT", "a_sufficiently_long_bank_salt_value")
+	t.Setenv("REGIONAL_PEPPER", "")
+	t.Setenv("MOSAIC_PEPPER", "")
+	t.Cleanup(func() { config.Reload() })
+	config.Reload()
+
+	withPanicIfCalledSignalID(t)
+
+	var captured processor.AnonymizedSignal
+	syncForward := func(_ context.Context, signal processor.AnonymizedSignal) error {
+		captured = signal
+		return nil
+	}
+	handler := processTransaction(nil, syncForward, "")
+
+	body := `{
+		"id": "CUST-001",
+		"name": "John Doe",
+		"national_id": "22345678901",
+		"account": "ACC-1234567890",
+		"amount": 950.00,
+		"timestamp": "2026-01-15T14:07:33Z",
+		"transaction_ref": "core-banking-ref-1"
+	}`
+	req := httptest.NewRequest(http.MethodPost, "/process", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	handler(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if captured.SignalID == "" {
+		t.Fatal("expected a derived signal_id")
 	}
 }
 

@@ -54,6 +54,7 @@ func resetReadinessState(t *testing.T) {
 	SetReadinessAuditStatus(nil)
 	SetReadinessThresholds(DefaultReadinessMaxDepthRatio, DefaultReadinessMaxStaleness)
 	SetReadinessMaxAuditFailures(DefaultReadinessMaxAuditFailures)
+	SetReadinessMaxSpoolFsyncFailures(DefaultReadinessMaxSpoolFsyncFailures)
 }
 
 func doLivenessCheck(t *testing.T) (*http.Response, map[string]interface{}) {
@@ -354,6 +355,127 @@ func TestReadinessCheckHandler_AuditThresholdIsConfigurable(t *testing.T) {
 	}
 }
 
+// TestReadinessCheckHandler_HealthyWithSpoolDirFsyncFailuresBelowThreshold
+// and TestReadinessCheckHandler_UnhealthyWhenSpoolDirFsyncFailuresCrossThreshold
+// pin the issue #15 wiring: a spool whose consecutive post-rename
+// directory-fsync failures (spool.Spool.DirFsyncFailures(), surfaced via
+// SpoolStatus.ConsecutiveDirFsyncFailures) cross
+// DefaultReadinessMaxSpoolFsyncFailures must flip /readyz unhealthy with a
+// distinct reason, the same way spool depth/staleness and the audit log's
+// consecutive-failure count do - this is what turns a persistent
+// directory-fsync failure into an alertable degraded state instead of a
+// silent, unbounded stream of Enqueue/processTransaction 500s.
+func TestReadinessCheckHandler_HealthyWithSpoolDirFsyncFailuresBelowThreshold(t *testing.T) {
+	resetReadinessState(t)
+	defer resetReadinessState(t)
+
+	SetReadinessSpoolStatus(func() SpoolStatus {
+		return SpoolStatus{
+			Depth: 1, MaxDepth: 1000, HasPending: false,
+			ConsecutiveDirFsyncFailures: DefaultReadinessMaxSpoolFsyncFailures - 1,
+		}
+	})
+
+	resp, body := doReadinessCheck(t)
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("status code = %d, want 200", resp.StatusCode)
+	}
+	if body["status"] != "healthy" {
+		t.Errorf("status = %v, want healthy", body["status"])
+	}
+	got, ok := body["spool_dir_fsync_consecutive_failures"].(float64)
+	if !ok {
+		t.Fatal("expected spool_dir_fsync_consecutive_failures to be reported when a spool status is registered")
+	}
+	if got != float64(DefaultReadinessMaxSpoolFsyncFailures-1) {
+		t.Errorf("spool_dir_fsync_consecutive_failures = %v, want %d", got, DefaultReadinessMaxSpoolFsyncFailures-1)
+	}
+}
+
+func TestReadinessCheckHandler_UnhealthyWhenSpoolDirFsyncFailuresCrossThreshold(t *testing.T) {
+	resetReadinessState(t)
+	defer resetReadinessState(t)
+
+	SetReadinessSpoolStatus(func() SpoolStatus {
+		return SpoolStatus{
+			Depth: 1, MaxDepth: 1000, HasPending: false,
+			ConsecutiveDirFsyncFailures: DefaultReadinessMaxSpoolFsyncFailures,
+		}
+	})
+
+	resp, body := doReadinessCheck(t)
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Errorf("status code = %d, want 503", resp.StatusCode)
+	}
+	if body["status"] != "unhealthy" {
+		t.Errorf("status = %v, want unhealthy", body["status"])
+	}
+	reasons, ok := body["reasons"].([]interface{})
+	if !ok || len(reasons) == 0 {
+		t.Fatal("expected reasons to explain why the gateway is unhealthy")
+	}
+	found := false
+	for _, r := range reasons {
+		if s, _ := r.(string); s == "spool directory fsync has failed for too many consecutive enqueues" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected a reason naming the persistent spool directory-fsync failure, got %v", reasons)
+	}
+}
+
+// TestReadinessCheckHandler_SpoolDirFsyncFailuresRecoverWhenCounterResets
+// checks recovery: once the registered SpoolStatus reports the counter
+// back at 0 (mirroring spool.Spool.DirFsyncFailures() resetting on the
+// next successful directory fsync - see internal/spool's
+// TestEnqueue_DirFsyncFailuresResetsOnSuccess), /readyz must go back to
+// healthy, not stay latched unhealthy from a prior scrape.
+func TestReadinessCheckHandler_SpoolDirFsyncFailuresRecoverWhenCounterResets(t *testing.T) {
+	resetReadinessState(t)
+	defer resetReadinessState(t)
+
+	failures := DefaultReadinessMaxSpoolFsyncFailures
+	SetReadinessSpoolStatus(func() SpoolStatus {
+		return SpoolStatus{Depth: 1, MaxDepth: 1000, HasPending: false, ConsecutiveDirFsyncFailures: failures}
+	})
+	if resp, _ := doReadinessCheck(t); resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("status code = %d, want 503 before recovery", resp.StatusCode)
+	}
+
+	failures = 0
+	resp, body := doReadinessCheck(t)
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("status code = %d, want 200 after the counter resets", resp.StatusCode)
+	}
+	if body["status"] != "healthy" {
+		t.Errorf("status = %v, want healthy after the counter resets", body["status"])
+	}
+}
+
+// TestReadinessCheckHandler_SpoolDirFsyncFailuresThresholdIsConfigurable
+// mirrors TestReadinessCheckHandler_AuditThresholdIsConfigurable for
+// READINESS_MAX_SPOOL_FSYNC_FAILURES.
+func TestReadinessCheckHandler_SpoolDirFsyncFailuresThresholdIsConfigurable(t *testing.T) {
+	resetReadinessState(t)
+	defer resetReadinessState(t)
+
+	// 2 consecutive failures would be fine under the default threshold (3)
+	// but breaches a tighter, explicitly configured threshold of 1.
+	SetReadinessMaxSpoolFsyncFailures(1)
+	SetReadinessSpoolStatus(func() SpoolStatus {
+		return SpoolStatus{Depth: 1, MaxDepth: 1000, HasPending: false, ConsecutiveDirFsyncFailures: 2}
+	})
+
+	resp, body := doReadinessCheck(t)
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Errorf("status code = %d, want 503", resp.StatusCode)
+	}
+	if body["status"] != "unhealthy" {
+		t.Errorf("status = %v, want unhealthy", body["status"])
+	}
+}
+
 // TestReadinessCheckHandler_AuditAndSpoolStatusAreIndependent checks the two
 // signals don't interfere: a perfectly healthy spool alongside a stuck
 // audit log must still report unhealthy (for the audit reason), and vice
@@ -375,6 +497,37 @@ func TestReadinessCheckHandler_AuditAndSpoolStatusAreIndependent(t *testing.T) {
 	}
 	if body["spool_depth"].(float64) != 1 {
 		t.Errorf("expected healthy spool state to still be reported, got spool_depth=%v", body["spool_depth"])
+	}
+}
+
+// TestMetricsHandler_SpoolDirFsyncFailuresCounter pins the issue #15
+// /metrics wiring: main.go's spool.Hooks.OnDirFsyncFailure records a
+// spool_dir_fsync_failures counter (via RecordMetric) on every consecutive
+// directory-fsync failure, mirroring how audit_write_failures is recorded.
+// RecordMetric/MetricsHandler are generic (any counter name registered is
+// exposed), so this test exercises that path directly with this metric's
+// specific name rather than re-testing spool.Spool's hook-firing logic,
+// which internal/spool's TestEnqueue_OnDirFsyncFailureHookFiresOnlyOnFailure
+// already covers.
+func TestMetricsHandler_SpoolDirFsyncFailuresCounter(t *testing.T) {
+	RecordMetric("spool_dir_fsync_failures", 1)
+	RecordMetric("spool_dir_fsync_failures", 1)
+
+	req := httptest.NewRequest("GET", "/metrics", nil)
+	w := httptest.NewRecorder()
+	MetricsHandler(w, req)
+
+	var body map[string]interface{}
+	if err := json.NewDecoder(w.Result().Body).Decode(&body); err != nil {
+		t.Fatalf("failed to decode metrics response: %v", err)
+	}
+
+	got, ok := body["spool_dir_fsync_failures"].(float64)
+	if !ok {
+		t.Fatal("expected spool_dir_fsync_failures to be present on /metrics")
+	}
+	if got < 2 {
+		t.Errorf("spool_dir_fsync_failures = %v, want at least 2 (tests share process-global metrics state)", got)
 	}
 }
 

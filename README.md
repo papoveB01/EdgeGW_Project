@@ -83,7 +83,7 @@ Send `national_id` (and `counterparty_national_id` on transfers) whenever availa
 | Endpoint | Method | Description |
 |----------|--------|-------------|
 | `/health` | GET | **Liveness** only: 200 whenever this process can serve HTTP, full stop. It never inspects the spool, so a full or stale spool during a destination outage — which a restart cannot fix — still reports healthy. This is what the Docker healthcheck (and the binary's `-healthcheck` self-probe) calls, and it is the **only** one of these three endpoints safe to wire to an auto-restart action (a Kubernetes `livenessProbe`, Swarm, an autoheal sidecar, etc). |
-| `/readyz` | GET | **Readiness/degradation**, not liveness: reports whether the gateway is keeping up, not just alive. Returns `503` with a `reasons` list when a registered spool is at/near capacity (see `READINESS_MAX_DEPTH_RATIO`) or its oldest pending signal has aged past a staleness threshold (see `READINESS_MAX_STALENESS_SECONDS`), or when the egress audit log (see [Egress audit log](#egress-audit-log)) has failed to write for `READINESS_MAX_AUDIT_FAILURES` consecutive confirmed deliveries. A full or stale spool, or a stuck audit log, during a destination outage is the durable queue (or the compliance record of it) working as designed, not a dead process — restarting fixes none of it, and would only add a self-inflicted `/process` outage on top. **Never wire this endpoint to an auto-restart action.** Wire it to alerting/paging, or, if used as a Kubernetes `readinessProbe`, to traffic removal only. |
+| `/readyz` | GET | **Readiness/degradation**, not liveness: reports whether the gateway is keeping up, not just alive. Returns `503` with a `reasons` list when a registered spool is at/near capacity (see `READINESS_MAX_DEPTH_RATIO`) or its oldest pending signal has aged past a staleness threshold (see `READINESS_MAX_STALENESS_SECONDS`), when `Enqueue`'s post-rename spool-directory fsync has failed for `READINESS_MAX_SPOOL_FSYNC_FAILURES` consecutive signals (see [Durable spool](#durable-spool)), or when the egress audit log (see [Egress audit log](#egress-audit-log)) has failed to write for `READINESS_MAX_AUDIT_FAILURES` consecutive confirmed deliveries. A full or stale spool, a persistent directory-fsync failure, or a stuck audit log, during a destination outage/degraded volume is the durable queue (or the compliance record of it) working as designed, not a dead process — restarting fixes none of it, and would only add a self-inflicted `/process` outage on top. **Never wire this endpoint to an auto-restart action.** Wire it to alerting/paging, or, if used as a Kubernetes `readinessProbe`, to traffic removal only. |
 | `/metrics` | GET | Operational metrics (signals processed, spool depth and age of oldest pending item, delivery failures and latency, uptime). Because egress to the destination is one-way, this and `/readyz` are the only way to tell a feed running hours behind from a healthy one. |
 | `/process` | POST | Accept raw transaction, anonymize, deliver to Hub (requires `INBOUND_API_KEY` when set). With `SPOOL_DIR` set: persists the anonymized signal and returns **202 Accepted**; a background forwarder delivers it. Without: forwards synchronously and returns 200 (or 502 on failure). |
 
@@ -214,6 +214,28 @@ confirmed deliveries — see [Egress audit log](#egress-audit-log)). Don't
 disable this to work around a slow disk without understanding that
 consequence.
 
+**A persistent directory-fsync failure is a degraded state, not a data-loss
+one — and `/readyz` says so.** A *transient* directory-fsync failure is the
+case above: the signal's file already has its final name and fsynced
+contents, so nothing is rolled back, `Enqueue` still returns an error (the
+202 promise genuinely isn't true yet), and the background forwarder
+delivers the signal anyway. On a *degraded* volume that keeps permitting
+writes and renames but not directory metadata syncs (plausible on some
+network or cluster filesystems), that same failure repeats on every
+subsequent `Enqueue` — every signal keeps queuing and delivering correctly,
+but every request gets a spurious `500` instead of `202`, and a core
+banking system that retries on `500` would produce an unbounded stream of
+duplicate signals to the vendor for a condition that isn't losing any
+data. Rather than only ever surface that as an error-per-request, the spool
+tracks consecutive directory-fsync failures (resetting to 0 the moment one
+succeeds again) and exposes it two ways: the `spool_dir_fsync_failures`
+counter on `/metrics` (every occurrence, mirroring `audit_write_failures`),
+and, once `READINESS_MAX_SPOOL_FSYNC_FAILURES` consecutive failures are
+reached (default: 3), a distinct `/readyz` reason — the same escalation
+shape `READINESS_MAX_AUDIT_FAILURES` already gives a stuck egress audit
+log. As with every other `/readyz` condition, **do not wire this to an
+auto-restart action** — see [API Endpoints](#api-endpoints).
+
 ### Egress audit log
 
 Neither the spool nor `/metrics` can answer "show me everything you sent
@@ -300,6 +322,7 @@ files accumulate until an operator archives or deletes them.
 | `READINESS_MAX_DEPTH_RATIO` | No | Fraction of `SPOOL_MAX_DEPTH` at/above which `/readyz` reports unhealthy (default: `0.95`). See [API Endpoints](#api-endpoints) — this must never be wired to an auto-restart action. |
 | `READINESS_MAX_STALENESS_SECONDS` | No | How old (in seconds) the oldest pending spool item may get before `/readyz` reports unhealthy (default: `900`, i.e. 15 minutes) |
 | `READINESS_MAX_AUDIT_FAILURES` | No | Consecutive egress-audit-log write failures (either delivery path) before `/readyz` reports unhealthy (default: `3`). See [Egress audit log](#egress-audit-log). |
+| `READINESS_MAX_SPOOL_FSYNC_FAILURES` | No | Consecutive `Enqueue` post-rename spool-directory fsync failures before `/readyz` reports unhealthy (default: `3`). See [Durable spool](#durable-spool) — this is a degraded-but-not-losing-data condition, same shape as `READINESS_MAX_AUDIT_FAILURES`. |
 | `GATEWAY_PORT` | No | Server port (default: 8080) |
 | `REPORTING_THRESHOLD` | No | AML reporting limit (default: 10000) |
 | `CONFIG_PATH` | No | Path to config JSON file (default: /config/gateway.json) |

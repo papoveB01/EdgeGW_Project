@@ -215,6 +215,11 @@ func main() {
 			adapters.SetReadinessMaxAuditFailures(n)
 		}
 	}
+	if v := os.Getenv("READINESS_MAX_SPOOL_FSYNC_FAILURES"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			adapters.SetReadinessMaxSpoolFsyncFailures(n)
+		}
+	}
 
 	// Durable spool (recommended): /process persists anonymized signals and
 	// returns 202; a background forwarder delivers them, so an outage of the
@@ -250,6 +255,11 @@ func main() {
 			OnOldestPendingAge: func(ageSeconds float64) {
 				adapters.SetGauge("spool_oldest_pending_age_seconds", int64(ageSeconds))
 			},
+			// A raw counter (also still recorded) for every occurrence,
+			// alongside the consecutive-failure count wired into
+			// SetReadinessSpoolStatus below - see issue #15 and
+			// spool.Hooks.OnDirFsyncFailure's doc comment.
+			OnDirFsyncFailure: func() { adapters.RecordMetric("spool_dir_fsync_failures", 1) },
 		})
 		if err != nil {
 			slog.Error("Failed to open spool", "dir", spoolDir, "error", err)
@@ -259,10 +269,11 @@ func main() {
 		adapters.SetReadinessSpoolStatus(func() adapters.SpoolStatus {
 			age, hasPending := sp.OldestPendingAge(time.Now())
 			return adapters.SpoolStatus{
-				Depth:            sp.Depth(),
-				MaxDepth:         sp.MaxDepth(),
-				OldestPendingAge: age,
-				HasPending:       hasPending,
+				Depth:                       sp.Depth(),
+				MaxDepth:                    sp.MaxDepth(),
+				OldestPendingAge:            age,
+				HasPending:                  hasPending,
+				ConsecutiveDirFsyncFailures: sp.DirFsyncFailures(),
 			}
 		})
 		slog.Info("Durable spool enabled", "dir", spoolDir, "max_depth", maxDepth, "pending", sp.Depth(), "fsync", sp.FsyncEnabled())

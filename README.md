@@ -157,6 +157,63 @@ enumerable offline). This replaces the old standalone-only
 "derive-a-local-pepper-from-BANK_SALT" behavior, which existed only because
 v2's global mosaic had no bank-salt fallback to begin with.
 
+### Durable spool
+
+Set `SPOOL_DIR` to enable the async delivery path: `/process` persists the
+anonymized signal to disk and returns **202 Accepted** before a background
+forwarder delivers it, so an outage of the destination (vendor platform, or
+a full/unwritable standalone sink) doesn't lose signals or block the core
+banking system.
+
+**What the 202 promises.** By default (`SPOOL_FSYNC` unset, or anything
+other than `false`), `Enqueue` fsyncs the signal's temp file before renaming
+it into place, then fsyncs the spool directory after the rename — so the
+202 means the signal survives a **host power loss**, not just a process
+crash (a plain process crash never loses anything either way, since the OS
+page cache holding the unsynced write survives it; fsync exists for the
+case where the *machine* goes down, not just the gateway process). If
+either fsync fails, `Enqueue` returns an error instead of reporting the
+signal queued, so `/process` returns a failure status rather than a 202 it
+can't back up; see `internal/spool.Enqueue`'s doc comment for exactly how
+each failure point is handled (and why a directory-fsync failure, unlike
+the earlier failure points, deliberately leaves the already-committed file
+in place rather than discarding it).
+
+**The cost, measured.** An fsync per signal puts a disk sync on `/process`'s
+hot path. Measured with `go test -bench BenchmarkEnqueue ./internal/spool/`
+on the development machine (Apple M3 Pro, macOS — see the caveat below):
+
+| | latency/op | implied throughput ceiling |
+|---|---|---|
+| `SPOOL_FSYNC` on (default), serial | ~6.7 ms | ~150 ops/sec |
+| `SPOOL_FSYNC` on (default), parallel callers | ~3.9 ms | ~250 ops/sec |
+| `SPOOL_FSYNC=false` | ~0.12–0.15 ms | ~7,000–8,000 ops/sec |
+
+Fsync is roughly 40–55x slower than skipping it — expected, since it's a
+disk sync rather than a page-cache write. Against this repo's own estimate
+of ~23 tx/sec average with peaks several times that for a mid-size retail
+bank, the default's ceiling (~150–250 ops/sec on this machine) clears that
+bar but without a huge margin, and it is a genuine tradeoff, not a free
+lunch — see the PR that introduced this measurement (closes #13) for the
+full discussion. **Caveat:** these numbers were taken on macOS, where Go's
+`os.File.Sync` issues `F_FULLFSYNC` (a full drive cache flush, stronger and
+slower than a bare POSIX fsync). This project's production target is Linux
+(see the Dockerfile), where a plain fsync — especially against a disk with
+a battery-backed or otherwise safe write cache — is typically substantially
+faster. Operators should re-run `BenchmarkEnqueue` against their own
+production storage before relying on either number.
+
+**Opting out.** `SPOOL_FSYNC=false` skips both fsyncs. Only set this if you
+have measured your own hardware and deliberately accepted the risk: with it
+set, a 202 means the signal is queued in a way that survives a *process*
+crash (gateway restart, container recreation) but **not** a *host* power
+loss or hard reset — a crash at the wrong moment can lose signals the core
+banking system was already told were durably queued, with no trace
+anywhere (the spool file is gone, and the egress audit log only records
+confirmed deliveries — see [Egress audit log](#egress-audit-log)). Don't
+disable this to work around a slow disk without understanding that
+consequence.
+
 ### Egress audit log
 
 Neither the spool nor `/metrics` can answer "show me everything you sent
@@ -237,6 +294,7 @@ files accumulate until an operator archives or deletes them.
 | `STANDALONE_SINK_DIR` | No | Directory for the local sink's newline-delimited JSON files in `standalone` mode (default: `./sink`; Docker default: `/sink`) |
 | `SPOOL_DIR` | Recommended | Durable queue directory; enables async 202 mode so a destination outage doesn't lose signals (Docker default: `/spool`) |
 | `SPOOL_MAX_DEPTH` | No | Max queued signals before /process returns 503 (default: 10000) |
+| `SPOOL_FSYNC` | No | Set to `false` to skip fsyncing the spool temp file and directory on enqueue (default: `true`/on). See [Durable spool](#durable-spool) — disabling this means a 202 no longer implies a signal survives host power loss, only a process crash. |
 | `EGRESS_AUDIT_DIR` | No (recommended for compliance) | Directory for the durable, append-only egress audit log (confirmed deliveries only — see [Egress audit log](#egress-audit-log)). Unset means no audit trail is written, logged loudly at startup |
 | `EGRESS_AUDIT_STORE_PAYLOAD` | No | Set to `true` to store the full delivered payload alongside its digest in the audit log (default: digest-only) |
 | `READINESS_MAX_DEPTH_RATIO` | No | Fraction of `SPOOL_MAX_DEPTH` at/above which `/readyz` reports unhealthy (default: `0.95`). See [API Endpoints](#api-endpoints) — this must never be wired to an auto-restart action. |
@@ -276,7 +334,7 @@ The gateway authenticates to the Hub using a 3-point handshake:
 - **Request body size limit** — 1MB max to prevent OOM attacks
 - **Structured JSON logging** — no PII in logs
 - **Graceful shutdown** — in-flight requests drain on SIGINT/SIGTERM (15s budget)
-- **Durable spool** — anonymized signals (never raw PII) persist to disk before acknowledgment; delivery survives Hub outages and gateway restarts, with dead-lettering for permanently rejected signals
+- **Durable spool** — anonymized signals (never raw PII) persist to disk, fsynced before acknowledgment by default (`SPOOL_FSYNC=false` opts out — see [Durable spool](#durable-spool)); delivery survives Hub outages and gateway restarts unconditionally, and (with fsync enabled, the default) host power loss/hard resets too, with dead-lettering for permanently rejected signals
 - **Bounded retry with exponential backoff** — 4xx Hub errors are not retried; in synchronous mode the full retry budget (~8.25s) fits inside the 10s write timeout; client cancellation stops retries
 
 ## Development

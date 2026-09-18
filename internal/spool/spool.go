@@ -3,6 +3,13 @@
 // then delivered to the Hub by a background forwarder — so Hub outages don't
 // lose signals and don't block the core banking system.
 //
+// "Persisted" means fsynced by default: Enqueue fsyncs the temp file before
+// rename and the spool directory after it, so the 202 covers a host power
+// loss, not just a process crash (whose in-memory page cache survives on
+// its own). SPOOL_FSYNC=false trades that guarantee for lower per-signal
+// latency — see README's "Durable spool" section for the measured cost and
+// exactly what is given up.
+//
 // Only anonymized payloads are ever written to disk; raw PII never touches
 // the spool.
 package spool
@@ -19,6 +26,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/papoveB01/EdgeGW_Project/internal/dirsync"
 )
 
 // ErrFull is returned by Enqueue when the spool has reached its depth limit.
@@ -65,6 +74,24 @@ type Spool struct {
 	seq             uint64
 	oldestPendingAt time.Time // zero value means no pending signal
 	wake            chan struct{}
+
+	// fsyncEnabled controls whether Enqueue fsyncs the temp file before
+	// rename and the spool directory after it, so a 202 Accepted means
+	// the signal survives a host power loss, not just a process crash.
+	// Read once, at New, from SPOOL_FSYNC (default true - fsync on). See
+	// README's "Durable spool" section for the measured per-signal cost
+	// and exactly what SPOOL_FSYNC=false gives up.
+	fsyncEnabled bool
+	// syncFile fsyncs an open file's contents. Defaults to (*os.File).Sync
+	// but is a field so tests can substitute an observing or
+	// failure-injecting stub, matching the pattern internal/auditlog and
+	// cmd/gateway/sink.go already use for their syncDir field.
+	syncFile func(*os.File) error
+	// syncDir fsyncs the spool directory after a rename, so the new
+	// file's directory entry - not just its contents - is durable.
+	// Defaults to dirsync.Sync; overridable in tests for the same reason
+	// as syncFile.
+	syncDir func(dir string) error
 }
 
 // New opens (or creates) a spool directory and counts any signals left over
@@ -74,12 +101,15 @@ func New(dir string, maxDepth int, forward ForwardFunc, isPermanent func(error) 
 		return nil, fmt.Errorf("failed to create spool dir: %w", err)
 	}
 	s := &Spool{
-		dir:         dir,
-		maxDepth:    maxDepth,
-		forward:     forward,
-		isPermanent: isPermanent,
-		hooks:       hooks,
-		wake:        make(chan struct{}, 1),
+		dir:          dir,
+		maxDepth:     maxDepth,
+		forward:      forward,
+		isPermanent:  isPermanent,
+		hooks:        hooks,
+		wake:         make(chan struct{}, 1),
+		fsyncEnabled: fsyncEnabledFromEnv(),
+		syncFile:     func(f *os.File) error { return f.Sync() },
+		syncDir:      dirsync.Sync,
 	}
 	pending, err := s.listPending()
 	if err != nil {
@@ -104,6 +134,15 @@ func (s *Spool) MaxDepth() int {
 	return s.maxDepth
 }
 
+// FsyncEnabled reports whether Enqueue fsyncs the temp file and the spool
+// directory (see SPOOL_FSYNC in README's "Durable spool" section). It never
+// changes after New, so it needs no locking. Exposed so callers (main.go's
+// startup logging) can report the resolved setting without duplicating
+// fsyncEnabledFromEnv's parsing rules.
+func (s *Spool) FsyncEnabled() bool {
+	return s.fsyncEnabled
+}
+
 // OldestPendingAge reports how long the oldest pending signal has been
 // waiting, as of now. hasPending is false when the queue is empty. This
 // reads a cached, in-memory value only (no disk I/O), so it is cheap enough
@@ -119,7 +158,18 @@ func (s *Spool) OldestPendingAge(now time.Time) (age time.Duration, hasPending b
 }
 
 // Enqueue durably persists one marshaled signal (write temp + rename, so a
-// crash mid-write never leaves a half-signal in the queue).
+// crash mid-write never leaves a half-signal in the queue), and, unless
+// SPOOL_FSYNC=false, fsyncs the temp file's contents before the rename and
+// the parent directory after it - so a crash is not the only failure mode
+// covered: a host power loss can't silently lose a signal the caller was
+// already told is durably queued either. s.mu is deliberately released
+// before any of this disk I/O (see the struct-level mu doc comment / manual
+// Lock/Unlock pairing below rather than defer) - the spool's bookkeeping
+// mutex must never be held across a disk operation.
+//
+// On any failure below, Enqueue returns a non-nil error rather than
+// reporting the signal as queued, so /process returns a failure status
+// instead of a 202 that would promise durability that isn't there.
 func (s *Spool) Enqueue(payload []byte) error {
 	s.mu.Lock()
 	if s.depth >= s.maxDepth {
@@ -133,9 +183,11 @@ func (s *Spool) Enqueue(payload []byte) error {
 
 	tmp := filepath.Join(s.dir, name+".tmp")
 	final := filepath.Join(s.dir, name)
-	if err := os.WriteFile(tmp, payload, 0o600); err != nil {
+
+	if err := s.writeTempFile(tmp, payload); err != nil {
+		os.Remove(tmp)
 		s.decDepth()
-		return fmt.Errorf("failed to write spool file: %w", err)
+		return err
 	}
 	if err := os.Rename(tmp, final); err != nil {
 		os.Remove(tmp)
@@ -144,12 +196,85 @@ func (s *Spool) Enqueue(payload []byte) error {
 	}
 	s.reportDepth()
 
-	// Nudge the forwarder without blocking if it's already awake.
+	// Nudge the forwarder without blocking if it's already awake. The file
+	// is committed under its final name at this point regardless of what
+	// the directory-fsync check below decides to report, so the
+	// background forwarder should get a chance to pick it up either way -
+	// see that check's comment for why.
 	select {
 	case s.wake <- struct{}{}:
 	default:
 	}
+
+	if s.fsyncEnabled {
+		if err := s.syncDir(s.dir); err != nil {
+			// The rename already committed the signal under its final
+			// name, and its contents are already fsynced (writeTempFile,
+			// above), so the background forwarder can and will still
+			// pick it up and deliver it like any other pending signal -
+			// there is nothing to roll back here, and removing the file
+			// or decrementing depth would silently lose a signal the
+			// queue has already committed to deliver, which is exactly
+			// backwards. What's uncertain is only whether the file's
+			// directory entry itself survives a host power loss right
+			// now. Matching this codebase's established durability
+			// failure semantics (see internal/dirsync's doc comment and
+			// auditlog.Record's directory-fsync-failure handling),
+			// Enqueue still reports FAILURE: the 202 promise is "this
+			// will survive a power loss", and that isn't true yet. A
+			// caller retry (or the bank's core system resubmitting) may
+			// produce a duplicate signal once this one is eventually
+			// delivered - an accepted cost, the same tradeoff this
+			// codebase already makes for audit-log writes.
+			return fmt.Errorf("failed to fsync spool directory: %w", err)
+		}
+	}
 	return nil
+}
+
+// writeTempFile creates tmp, writes payload, and - unless fsync is disabled
+// via SPOOL_FSYNC=false - fsyncs its contents before closing. The caller
+// (Enqueue) is responsible for removing tmp on any error this returns.
+func (s *Spool) writeTempFile(tmp string, payload []byte) error {
+	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err != nil {
+		return fmt.Errorf("failed to create spool temp file: %w", err)
+	}
+	if _, err := f.Write(payload); err != nil {
+		f.Close()
+		return fmt.Errorf("failed to write spool file: %w", err)
+	}
+	if s.fsyncEnabled {
+		if err := s.syncFile(f); err != nil {
+			f.Close()
+			return fmt.Errorf("failed to fsync spool temp file: %w", err)
+		}
+	}
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("failed to close spool temp file: %w", err)
+	}
+	return nil
+}
+
+// fsyncEnabledFromEnv reads SPOOL_FSYNC, defaulting to true (fsync on) so
+// the 202 Accepted a bank's core banking system receives means what it
+// says: the signal survives host power loss, not just a process crash.
+// Operators who have measured their own hardware and accepted the risk of
+// a narrower durability guarantee can opt out with SPOOL_FSYNC=false - see
+// README's "Durable spool" section for the measured cost and exactly what
+// is given up. Any unrecognized value fails safe toward fsync-on (the
+// whole point of this default) rather than silently disabling the
+// durability guarantee on a typo.
+func fsyncEnabledFromEnv() bool {
+	v := os.Getenv("SPOOL_FSYNC")
+	if v == "" {
+		return true
+	}
+	enabled, err := strconv.ParseBool(v)
+	if err != nil {
+		return true
+	}
+	return enabled
 }
 
 // Run delivers spooled signals oldest-first until ctx is cancelled. Retryable

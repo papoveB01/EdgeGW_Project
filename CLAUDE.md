@@ -273,6 +273,19 @@ of those names — the zero-padding is load-bearing. Enqueue writes to `.tmp` th
 renames, so a crash never leaves a half-signal. Only anonymized payloads are ever
 written to disk; raw PII must never reach the spool.
 
+By default `Enqueue` also fsyncs the temp file before rename and the spool
+directory after it (`internal/dirsync.Sync`, same primitive PR #11 gave
+`internal/auditlog` and `cmd/gateway/sink.go`), so the 202 a signal's enqueue
+backs actually means the signal survives a host power loss, not just a
+process crash — atomicity (the write-temp-then-rename) and durability
+(fsync) are different guarantees; the rename alone only gave the former.
+`SPOOL_FSYNC=false` opts out for operators who have measured their own
+hardware — see README's "Durable spool" section for the measured cost and
+exactly what that opt-out gives up. `Enqueue` releases `s.mu` before any of
+this disk I/O (manual `Lock`/`Unlock` pairing, not `defer`, for exactly this
+reason) — **the spool's bookkeeping mutex must never be held across a disk
+operation**; preserve that if you touch `Enqueue` again.
+
 ## Conventions
 
 - **Every commit needs a DCO sign-off** (`git commit -s`); unsigned commits can't

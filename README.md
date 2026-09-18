@@ -171,9 +171,12 @@ written to the local sink in standalone mode) — never of an attempt or an
 enqueue. Records are newline-delimited JSON, one file per UTC day (same
 convention as the standalone sink), fsynced before being reported as
 written, and contain the delivery timestamp, the destination, `signal_id`,
-`mosaic_version`, `feature_version`, `mosaic_scope`, and a SHA-256 digest of
-the exact delivered payload bytes — proof of what was sent without
-necessarily keeping a second copy of it. The full payload is stored only if
+`mosaic_version`, `feature_version`, `mosaic_scope`, `mosaic_basis` (see
+[Mosaic scopes (v3)](#mosaic-scopes-v3) — scope and basis are orthogonal, so
+the audit record carries both rather than silently dropping one), and a
+SHA-256 digest of the exact delivered payload bytes — proof of what was
+sent without necessarily keeping a second copy of it. The full payload is
+stored only if
 `EGRESS_AUDIT_STORE_PAYLOAD=true` is set explicitly; the default is
 digest-only, because the payload is pseudonymized but still personal data,
 and a second copy is a second liability. Audit files are written `0o600`

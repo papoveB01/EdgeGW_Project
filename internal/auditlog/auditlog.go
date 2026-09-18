@@ -52,12 +52,21 @@ type Record struct {
 	// needed to answer "what did we send" and duplicating it doubles the
 	// re-identification surface of this file for no audit benefit.
 	SignalID string `json:"signal_id"`
-	// MosaicVersion / FeatureVersion / MosaicScope are copied from the
-	// delivered signal so an auditor can tell which derivation and feature
-	// contract produced it without cross-referencing anything else.
+	// MosaicVersion / FeatureVersion / MosaicScope / MosaicBasis are
+	// copied from the delivered signal so an auditor can tell which
+	// derivation and feature contract produced it without
+	// cross-referencing anything else. MosaicScope and MosaicBasis are
+	// orthogonal (processor.ScopeBank/ScopeRegional and
+	// processor.BasisNationalID/BasisInternalIDFallback as of mosaic
+	// v3): scope is WHICH SECRET keyed the mosaic (so whether it's valid
+	// to compare across institutions), basis is WHAT IDENTIFIER produced
+	// it (so how stable/reliable it is). Recording scope but silently
+	// omitting basis would leave exactly the kind of evidentiary gap
+	// this audit log exists to prevent.
 	MosaicVersion  int    `json:"mosaic_version"`
 	FeatureVersion int    `json:"feature_version"`
 	MosaicScope    string `json:"mosaic_scope"`
+	MosaicBasis    string `json:"mosaic_basis"`
 	// PayloadSHA256 is the hex-encoded SHA-256 digest of the EXACT bytes
 	// delivered to the destination — durable proof of WHAT was sent
 	// without necessarily storing a second copy of it.
@@ -153,7 +162,7 @@ func probeWritable(dir string) error {
 // auditingForward for how callers must react to that (retry, accepting a
 // possible duplicate delivery, rather than silently treating the confirmed
 // delivery as fully accounted for).
-func (l *Logger) Record(destination, signalID string, mosaicVersion, featureVersion int, mosaicScope string, payload []byte, deliveredAt time.Time) error {
+func (l *Logger) Record(destination, signalID string, mosaicVersion, featureVersion int, mosaicScope, mosaicBasis string, payload []byte, deliveredAt time.Time) error {
 	digest := sha256.Sum256(payload)
 	rec := Record{
 		Timestamp:      deliveredAt.UTC().Format(time.RFC3339Nano),
@@ -162,6 +171,7 @@ func (l *Logger) Record(destination, signalID string, mosaicVersion, featureVers
 		MosaicVersion:  mosaicVersion,
 		FeatureVersion: featureVersion,
 		MosaicScope:    mosaicScope,
+		MosaicBasis:    mosaicBasis,
 		PayloadSHA256:  hex.EncodeToString(digest[:]),
 		PayloadBytes:   len(payload),
 	}

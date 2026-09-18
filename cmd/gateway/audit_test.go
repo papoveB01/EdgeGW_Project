@@ -92,7 +92,7 @@ func TestAuditingForward_WritesOnlyAfterConfirmedDelivery(t *testing.T) {
 				deliverCalled = true
 				return tt.deliverErr
 			})
-			wrapped := auditingForward(deliver, logger, "https://vendor.example/signals", newAuditHealth())
+			wrapped := auditingForward(deliver, logger, "https://vendor.example/signals", newAuditHealth(), newRedeliveryGuard())
 
 			payload := []byte(`{"signal_id":"sig-confirmed","mosaic_version":2,"feature_version":1,"mosaic_scope":"local"}`)
 			gotErr := wrapped(context.Background(), payload)
@@ -140,7 +140,7 @@ func TestAuditingForward_AuditWriteFailureAfterDeliveryIsReportedAsFailure(t *te
 		return nil // destination accepted the signal
 	})
 	health := newAuditHealth()
-	wrapped := auditingForward(deliver, logger, "https://vendor.example/signals", health)
+	wrapped := auditingForward(deliver, logger, "https://vendor.example/signals", health, newRedeliveryGuard())
 
 	before := metricValue(t, "audit_write_failures")
 	payload := []byte(`{"signal_id":"sig-audit-fail","mosaic_version":2,"feature_version":1,"mosaic_scope":"local"}`)
@@ -183,7 +183,7 @@ func TestAuditingForward_DoesNotRedeliverWhileRetryingOnlyTheAuditWrite(t *testi
 		return nil
 	})
 	health := newAuditHealth()
-	wrapped := auditingForward(deliver, logger, "https://vendor.example/signals", health)
+	wrapped := auditingForward(deliver, logger, "https://vendor.example/signals", health, newRedeliveryGuard())
 
 	payload := []byte(`{"signal_id":"sig-retry-storm","mosaic_version":2,"feature_version":1,"mosaic_scope":"local"}`)
 
@@ -226,7 +226,7 @@ func TestAuditingForward_RedeliversADifferentPayloadNormally(t *testing.T) {
 		return nil
 	})
 	health := newAuditHealth()
-	wrapped := auditingForward(deliver, logger, "https://vendor.example/signals", health)
+	wrapped := auditingForward(deliver, logger, "https://vendor.example/signals", health, newRedeliveryGuard())
 
 	payloadA := []byte(`{"signal_id":"sig-a","mosaic_version":2,"feature_version":1,"mosaic_scope":"local"}`)
 	payloadB := []byte(`{"signal_id":"sig-b","mosaic_version":2,"feature_version":1,"mosaic_scope":"local"}`)
@@ -363,7 +363,7 @@ func TestAuditingForward_DigestMatchesExactDeliveredBytes(t *testing.T) {
 	t.Cleanup(func() { logger.Close() })
 
 	deliver := spool.ForwardFunc(func(ctx context.Context, payload []byte) error { return nil })
-	wrapped := auditingForward(deliver, logger, "https://vendor.example/signals", newAuditHealth())
+	wrapped := auditingForward(deliver, logger, "https://vendor.example/signals", newAuditHealth(), newRedeliveryGuard())
 
 	payload := []byte(`{"signal_id":"sig-digest","mosaic_version":2,"feature_version":1,"mosaic_scope":"local","amount_tier":"TIER_1"}`)
 	if err := wrapped(context.Background(), payload); err != nil {
@@ -400,5 +400,114 @@ func assertRecordedDigestMatches(t *testing.T, dir string, wantPayload []byte) {
 	}
 	if rec.PayloadBytes != len(wantPayload) {
 		t.Errorf("payload_bytes mismatch: got %d want %d", rec.PayloadBytes, len(wantPayload))
+	}
+}
+
+// TestAuditingForward_DeadLetterOutOfBandClearsGuard is FIX 1's regression
+// test. spool.forwardOldest has a path that removes the head item WITHOUT
+// ever calling the wrapped ForwardFunc closure: when os.ReadFile on the
+// item's file fails, it dead-letters the item directly. If that fires on
+// the item the redeliveryGuard is currently holding a digest for (delivered,
+// audit write still failing), the digest goes stale - it now describes an
+// item that has already left the queue by a path the guard never observed.
+//
+// If the NEXT queued item then happens to have a byte-identical marshaled
+// payload - not far-fetched here: signal_id is a deterministic HMAC of
+// transaction_ref, and the emitted timestamp is the 15-minute BUCKETED
+// value, not time.Now(), so a genuine core-banking retry of the same
+// transaction reproduces byte-identical JSON (AnonymizeSignal is a pure
+// function) - a stale guard would report "already delivered", skip the
+// real delivery, and write an audit record asserting delivery happened
+// when it never did. A false "delivered" record is worse than a missing
+// one: the whole point of this log is that a record means the data left
+// the institution.
+//
+// This reproduces the scenario directly: deliver item 1 and fail its audit
+// write (the guard ends up holding item 1's digest), simulate the
+// out-of-band dead-letter by calling guard.clear() directly - exactly what
+// main.go's spool.Hooks.OnDead callback does - then feed a byte-identical
+// payload through as "item 2" and assert it is ACTUALLY DELIVERED a second
+// time, not silently skipped.
+func TestAuditingForward_DeadLetterOutOfBandClearsGuard(t *testing.T) {
+	dir := t.TempDir()
+	logger := blockedLogger(t, dir)
+
+	var deliverCalls int32
+	deliver := spool.ForwardFunc(func(ctx context.Context, payload []byte) error {
+		atomic.AddInt32(&deliverCalls, 1)
+		return nil
+	})
+	health := newAuditHealth()
+	guard := newRedeliveryGuard()
+	wrapped := auditingForward(deliver, logger, "https://vendor.example/signals", health, guard)
+
+	// A payload that is byte-identical across two logically distinct spool
+	// items - the realistic condition that makes the bug reachable.
+	payload := []byte(`{"signal_id":"sig-retry-item","mosaic_version":3,"feature_version":1,"mosaic_scope":"bank","mosaic_basis":"national_id"}`)
+
+	// Item 1: delivered, but the (deliberately blocked) audit write fails -
+	// guard now holds digest(payload).
+	if err := wrapped(context.Background(), payload); err == nil {
+		t.Fatal("expected the blocked audit write to fail for item 1")
+	}
+	if got := atomic.LoadInt32(&deliverCalls); got != 1 {
+		t.Fatalf("expected 1 delivery for item 1, got %d", got)
+	}
+
+	// Simulate spool.forwardOldest's unreadable-spool-file branch
+	// dead-lettering item 1 WITHOUT ever calling wrapped again - exactly
+	// what main.go wires spool.Hooks.OnDead to do in response.
+	guard.clear()
+
+	// Item 2: a genuinely different, but byte-identical, spool item.
+	// Before FIX 1, guard.matches(digest) would still (wrongly) report
+	// true here, skip deliver, and - had the audit write happened to
+	// succeed - produce a FALSE "delivered" record for a signal that never
+	// left the bank. After the fix, the guard is empty, so this must be
+	// treated as a fresh delivery.
+	if err := wrapped(context.Background(), payload); err == nil {
+		t.Fatal("expected the still-blocked audit write to fail for item 2 as well")
+	}
+	if got := atomic.LoadInt32(&deliverCalls); got != 2 {
+		t.Fatalf("expected item 2 to be ACTUALLY DELIVERED (2 total deliveries), got %d - "+
+			"a stale guard is letting a delivery be silently skipped, which would produce a false audit record", got)
+	}
+}
+
+// TestAuditingForward_RecordsMosaicBasis is FIX 3's regression test:
+// mosaic_basis is orthogonal to mosaic_scope as of mosaic v3
+// (processor.ScopeBank/ScopeRegional vs. processor.BasisNationalID/
+// BasisInternalIDFallback) and must be captured in the audit record - an
+// audit log that records scope but silently drops basis would still leave
+// an evidentiary gap, just a smaller one.
+func TestAuditingForward_RecordsMosaicBasis(t *testing.T) {
+	dir := t.TempDir()
+	logger, err := auditlog.New(dir, false)
+	if err != nil {
+		t.Fatalf("auditlog.New: %v", err)
+	}
+	t.Cleanup(func() { logger.Close() })
+
+	deliver := spool.ForwardFunc(func(ctx context.Context, payload []byte) error { return nil })
+	wrapped := auditingForward(deliver, logger, "https://vendor.example/signals", newAuditHealth(), newRedeliveryGuard())
+
+	payload := []byte(`{"signal_id":"sig-basis","mosaic_version":3,"feature_version":1,"mosaic_scope":"regional","mosaic_basis":"national_id"}`)
+	if err := wrapped(context.Background(), payload); err != nil {
+		t.Fatalf("wrapped forward: %v", err)
+	}
+
+	data, err := os.ReadFile(todaysAuditFile(dir))
+	if err != nil {
+		t.Fatalf("reading audit file: %v", err)
+	}
+	var rec auditlog.Record
+	if err := json.Unmarshal(data[:len(data)-1], &rec); err != nil {
+		t.Fatalf("unmarshal record: %v", err)
+	}
+	if rec.MosaicScope != "regional" {
+		t.Errorf("mosaic_scope = %q, want %q", rec.MosaicScope, "regional")
+	}
+	if rec.MosaicBasis != "national_id" {
+		t.Errorf("mosaic_basis = %q, want %q (mosaic_basis must not be silently dropped)", rec.MosaicBasis, "national_id")
 	}
 }

@@ -137,6 +137,16 @@ func main() {
 	// sink) for permanent personal-data records shouldn't get one silently
 	// created under their working directory.
 	var auditLogger *auditlog.Logger
+	// redeliverGuard backs auditingForward's retry-storm bound (see that
+	// function's doc comment). It must be cleared whenever the spool
+	// dead-letters an item WITHOUT going through auditingForward's closure
+	// (forwardOldest's unreadable-spool-file branch does exactly that) - see
+	// redeliveryGuard's doc comment for why a stale guard would otherwise
+	// risk a FALSE "delivered" audit record. Declared here (nil until the
+	// audit block below possibly sets it) so the spool's OnDead hook, wired
+	// further down, can reach it regardless of whether audit logging is
+	// enabled.
+	var redeliverGuard *redeliveryGuard
 	if auditDir := os.Getenv("EGRESS_AUDIT_DIR"); auditDir != "" {
 		storePayload := os.Getenv("EGRESS_AUDIT_STORE_PAYLOAD") == "true"
 		var err error
@@ -154,7 +164,8 @@ func main() {
 		// no other automatic degradation signal the way the spool has
 		// staleness.
 		health := newAuditHealth()
-		deliver = auditingForward(deliver, auditLogger, destination, health)
+		redeliverGuard = newRedeliveryGuard()
+		deliver = auditingForward(deliver, auditLogger, destination, health, redeliverGuard)
 		syncDeliverBytes = auditingSyncForward(syncDeliverBytes, auditLogger, destination, health)
 		adapters.SetReadinessAuditStatus(func() adapters.AuditStatus { return health.status() })
 		slog.Info("Egress audit log enabled", "dir", auditDir, "store_full_payload", storePayload, "destination", destination)
@@ -220,9 +231,22 @@ func main() {
 		var err error
 		sp, err = spool.New(spoolDir, maxDepth, deliver, adapters.IsPermanent, spool.Hooks{
 			OnDelivered: func(queueTime time.Duration) { adapters.RecordDelivery(queueTime) },
-			OnDead:      func() { adapters.RecordMetric("signals_dead_lettered", 1) },
-			OnFailed:    func() { adapters.RecordMetric("delivery_attempt_failures", 1) },
-			OnDepth:     func(d int) { adapters.SetGauge("spool_depth", int64(d)) },
+			OnDead: func() {
+				adapters.RecordMetric("signals_dead_lettered", 1)
+				// Any dead-letter event means an item just left the queue
+				// - including via forwardOldest's unreadable-spool-file
+				// branch, which bypasses auditingForward's closure
+				// entirely. redeliverGuard must forget whatever it was
+				// holding so a later, byte-identical payload can't be
+				// mistaken for "already delivered" - see
+				// redeliveryGuard's doc comment. nil (no
+				// EGRESS_AUDIT_DIR configured) is a safe no-op.
+				if redeliverGuard != nil {
+					redeliverGuard.clear()
+				}
+			},
+			OnFailed: func() { adapters.RecordMetric("delivery_attempt_failures", 1) },
+			OnDepth:  func(d int) { adapters.SetGauge("spool_depth", int64(d)) },
 			OnOldestPendingAge: func(ageSeconds float64) {
 				adapters.SetGauge("spool_oldest_pending_age_seconds", int64(ageSeconds))
 			},

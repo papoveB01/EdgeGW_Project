@@ -46,7 +46,7 @@ func TestRecord_DigestMatchesKnownBytes(t *testing.T) {
 	wantDigest := hex.EncodeToString(sum[:])
 
 	deliveredAt := time.Date(2026, 3, 15, 12, 0, 0, 0, time.UTC)
-	if err := l.Record("https://vendor.example/signals", "abc-123", 2, 1, "local", payload, deliveredAt); err != nil {
+	if err := l.Record("https://vendor.example/signals", "abc-123", 2, 1, "local", "national_id", payload, deliveredAt); err != nil {
 		t.Fatalf("Record: %v", err)
 	}
 
@@ -69,7 +69,7 @@ func TestRecord_DigestMatchesKnownBytes(t *testing.T) {
 	if rec.Timestamp != "2026-03-15T12:00:00Z" {
 		t.Errorf("unexpected timestamp: %s", rec.Timestamp)
 	}
-	if rec.SignalID != "abc-123" || rec.MosaicVersion != 2 || rec.FeatureVersion != 1 || rec.MosaicScope != "local" {
+	if rec.SignalID != "abc-123" || rec.MosaicVersion != 2 || rec.FeatureVersion != 1 || rec.MosaicScope != "local" || rec.MosaicBasis != "national_id" {
 		t.Errorf("unexpected record fields: %+v", rec)
 	}
 	if len(rec.Payload) != 0 {
@@ -100,7 +100,7 @@ func TestRecord_PayloadOptIn(t *testing.T) {
 
 			payload := []byte(`{"signal_id":"x","mosaic_scope":"local"}`)
 			deliveredAt := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
-			if err := l.Record("dest", "x", 2, 1, "local", payload, deliveredAt); err != nil {
+			if err := l.Record("dest", "x", 2, 1, "local", "national_id", payload, deliveredAt); err != nil {
 				t.Fatalf("Record: %v", err)
 			}
 
@@ -139,7 +139,7 @@ func TestRecord_SurvivesRestart(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New (first process): %v", err)
 	}
-	if err := l1.Record("dest", "sig-1", 2, 1, "local", []byte(`{"signal_id":"sig-1"}`), deliveredAt); err != nil {
+	if err := l1.Record("dest", "sig-1", 2, 1, "local", "national_id", []byte(`{"signal_id":"sig-1"}`), deliveredAt); err != nil {
 		t.Fatalf("Record: %v", err)
 	}
 	if err := l1.Close(); err != nil {
@@ -152,7 +152,7 @@ func TestRecord_SurvivesRestart(t *testing.T) {
 		t.Fatalf("New (second process): %v", err)
 	}
 	t.Cleanup(func() { l2.Close() })
-	if err := l2.Record("dest", "sig-2", 2, 1, "local", []byte(`{"signal_id":"sig-2"}`), deliveredAt); err != nil {
+	if err := l2.Record("dest", "sig-2", 2, 1, "local", "national_id", []byte(`{"signal_id":"sig-2"}`), deliveredAt); err != nil {
 		t.Fatalf("Record after restart: %v", err)
 	}
 
@@ -186,10 +186,10 @@ func TestRecord_DayRollover(t *testing.T) {
 
 	day1 := time.Date(2026, 2, 28, 23, 59, 59, 0, time.UTC)
 	day2 := time.Date(2026, 3, 1, 0, 0, 1, 0, time.UTC)
-	if err := l.Record("dest", "sig-day1", 2, 1, "local", []byte(`{}`), day1); err != nil {
+	if err := l.Record("dest", "sig-day1", 2, 1, "local", "national_id", []byte(`{}`), day1); err != nil {
 		t.Fatalf("Record day1: %v", err)
 	}
-	if err := l.Record("dest", "sig-day2", 2, 1, "local", []byte(`{}`), day2); err != nil {
+	if err := l.Record("dest", "sig-day2", 2, 1, "local", "national_id", []byte(`{}`), day2); err != nil {
 		t.Fatalf("Record day2: %v", err)
 	}
 
@@ -230,7 +230,7 @@ func TestRecord_FilePermissions(t *testing.T) {
 	t.Cleanup(func() { l.Close() })
 
 	deliveredAt := time.Date(2026, 4, 4, 4, 4, 4, 0, time.UTC)
-	if err := l.Record("dest", "sig", 2, 1, "local", []byte(`{}`), deliveredAt); err != nil {
+	if err := l.Record("dest", "sig", 2, 1, "local", "national_id", []byte(`{}`), deliveredAt); err != nil {
 		t.Fatalf("Record: %v", err)
 	}
 

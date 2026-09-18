@@ -91,8 +91,9 @@ type Logger struct {
 }
 
 // New opens (creating if needed) the directory audit records are written
-// under. storePayload controls whether Record embeds the full delivered
-// payload (opt-in) or only its digest (the default) — see Record.Payload.
+// under, and verifies it is actually writable before returning. storePayload
+// controls whether Record embeds the full delivered payload (opt-in) or only
+// its digest (the default) — see Record.Payload.
 //
 // The directory is created 0o700, not sink.go's 0o755: these records are
 // personal data (pseudonymized, but still), this is the durable, retained
@@ -103,7 +104,39 @@ func New(dir string, storePayload bool) (*Logger, error) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, fmt.Errorf("failed to create audit log dir: %w", err)
 	}
+	if err := probeWritable(dir); err != nil {
+		return nil, fmt.Errorf("audit log directory %q is not writable: %w", dir, err)
+	}
 	return &Logger{dir: dir, storePayload: storePayload}, nil
+}
+
+// probeWritable verifies dir can actually be written to and fsynced.
+// os.MkdirAll succeeding only proves the directory exists (or already did)
+// — a read-only bind mount, wrong ownership, or a full filesystem all pass
+// MkdirAll silently on an already-existing directory and would otherwise
+// only be discovered at the first CONFIRMED delivery, by which point the
+// destination has already accepted the signal: exactly the situation this
+// package exists to prevent. Callers (cmd/gateway's main) already
+// os.Exit(1) when New returns an error, so this makes a misconfigured
+// EGRESS_AUDIT_DIR fail fast at startup, the same as every other required
+// config, rather than at the first delivery.
+func probeWritable(dir string) error {
+	f, err := os.CreateTemp(dir, ".audit-writability-probe-*")
+	if err != nil {
+		return fmt.Errorf("failed to create probe file: %w", err)
+	}
+	name := f.Name()
+	defer os.Remove(name)
+
+	if _, err := f.Write([]byte("ok")); err != nil {
+		f.Close()
+		return fmt.Errorf("failed to write probe file: %w", err)
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		return fmt.Errorf("failed to fsync probe file: %w", err)
+	}
+	return f.Close()
 }
 
 // Record durably appends one audit entry for a CONFIRMED delivery. Callers

@@ -51,7 +51,9 @@ func TestProcessInboundRequest_Rejects(t *testing.T) {
 func resetReadinessState(t *testing.T) {
 	t.Helper()
 	SetReadinessSpoolStatus(nil)
+	SetReadinessAuditStatus(nil)
 	SetReadinessThresholds(DefaultReadinessMaxDepthRatio, DefaultReadinessMaxStaleness)
+	SetReadinessMaxAuditFailures(DefaultReadinessMaxAuditFailures)
 }
 
 func doLivenessCheck(t *testing.T) (*http.Response, map[string]interface{}) {
@@ -229,6 +231,150 @@ func TestReadinessCheckHandler_NoPendingSkipsStalenessCheck(t *testing.T) {
 	}
 	if _, present := body["oldest_pending_seconds"]; present {
 		t.Error("oldest_pending_seconds should be omitted when there is nothing pending")
+	}
+}
+
+// TestHealthCheckHandler_AlwaysHealthyRegardlessOfAuditStatus mirrors
+// TestHealthCheckHandler_AlwaysHealthyRegardlessOfSpoolState for the audit
+// status: a stuck egress audit log is a DEGRADED condition (see
+// AuditStatus's doc comment), never something a restart can fix, so
+// liveness must ignore it just as it ignores spool state.
+func TestHealthCheckHandler_AlwaysHealthyRegardlessOfAuditStatus(t *testing.T) {
+	resetReadinessState(t)
+	defer resetReadinessState(t)
+
+	SetReadinessAuditStatus(func() AuditStatus {
+		return AuditStatus{ConsecutiveFailures: 999}
+	})
+
+	resp, body := doLivenessCheck(t)
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("status code = %d, want 200 (liveness must not 503 on audit status)", resp.StatusCode)
+	}
+	if body["status"] != "healthy" {
+		t.Errorf("status = %v, want healthy", body["status"])
+	}
+}
+
+// TestReadinessCheckHandler_HealthyWithoutAuditStatus checks the default
+// (no EGRESS_AUDIT_DIR configured, SetReadinessAuditStatus never called)
+// doesn't make /readyz consider audit health at all.
+func TestReadinessCheckHandler_HealthyWithoutAuditStatus(t *testing.T) {
+	resetReadinessState(t)
+	defer resetReadinessState(t)
+
+	resp, body := doReadinessCheck(t)
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("status code = %d, want 200", resp.StatusCode)
+	}
+	if body["status"] != "healthy" {
+		t.Errorf("status = %v, want healthy", body["status"])
+	}
+	if _, present := body["audit_consecutive_failures"]; present {
+		t.Error("audit_consecutive_failures should be omitted when no audit status is registered")
+	}
+}
+
+// TestReadinessCheckHandler_HealthyWithAuditFailuresBelowThreshold and
+// TestReadinessCheckHandler_UnhealthyWhenAuditFailuresCrossThreshold pin the
+// CHANGE 2 wiring: an egress-audit-log stuck for DefaultReadinessMaxAuditFailures
+// consecutive writes must flip /readyz unhealthy with a distinct reason,
+// the same way spool depth/staleness do - this is synchronous mode's only
+// automatic degradation signal (see AuditStatus's doc comment).
+func TestReadinessCheckHandler_HealthyWithAuditFailuresBelowThreshold(t *testing.T) {
+	resetReadinessState(t)
+	defer resetReadinessState(t)
+
+	SetReadinessAuditStatus(func() AuditStatus {
+		return AuditStatus{ConsecutiveFailures: DefaultReadinessMaxAuditFailures - 1}
+	})
+
+	resp, body := doReadinessCheck(t)
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("status code = %d, want 200", resp.StatusCode)
+	}
+	if body["status"] != "healthy" {
+		t.Errorf("status = %v, want healthy", body["status"])
+	}
+	if got := body["audit_consecutive_failures"].(float64); got != float64(DefaultReadinessMaxAuditFailures-1) {
+		t.Errorf("audit_consecutive_failures = %v, want %d", got, DefaultReadinessMaxAuditFailures-1)
+	}
+}
+
+func TestReadinessCheckHandler_UnhealthyWhenAuditFailuresCrossThreshold(t *testing.T) {
+	resetReadinessState(t)
+	defer resetReadinessState(t)
+
+	SetReadinessAuditStatus(func() AuditStatus {
+		return AuditStatus{ConsecutiveFailures: DefaultReadinessMaxAuditFailures}
+	})
+
+	resp, body := doReadinessCheck(t)
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Errorf("status code = %d, want 503", resp.StatusCode)
+	}
+	if body["status"] != "unhealthy" {
+		t.Errorf("status = %v, want unhealthy", body["status"])
+	}
+	reasons, ok := body["reasons"].([]interface{})
+	if !ok || len(reasons) == 0 {
+		t.Fatal("expected reasons to explain why the gateway is unhealthy")
+	}
+	found := false
+	for _, r := range reasons {
+		if s, _ := r.(string); s != "" && (s == "egress audit log has failed to write for too many consecutive deliveries") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected a reason naming the stuck egress audit log, got %v", reasons)
+	}
+}
+
+// TestReadinessCheckHandler_AuditThresholdIsConfigurable mirrors
+// TestReadinessCheckHandler_ThresholdsAreConfigurable for the audit
+// threshold.
+func TestReadinessCheckHandler_AuditThresholdIsConfigurable(t *testing.T) {
+	resetReadinessState(t)
+	defer resetReadinessState(t)
+
+	// 2 consecutive failures would be fine under the default threshold (3)
+	// but breaches a tighter, explicitly configured threshold of 1.
+	SetReadinessMaxAuditFailures(1)
+	SetReadinessAuditStatus(func() AuditStatus {
+		return AuditStatus{ConsecutiveFailures: 2}
+	})
+
+	resp, body := doReadinessCheck(t)
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Errorf("status code = %d, want 503", resp.StatusCode)
+	}
+	if body["status"] != "unhealthy" {
+		t.Errorf("status = %v, want unhealthy", body["status"])
+	}
+}
+
+// TestReadinessCheckHandler_AuditAndSpoolStatusAreIndependent checks the two
+// signals don't interfere: a perfectly healthy spool alongside a stuck
+// audit log must still report unhealthy (for the audit reason), and vice
+// versa.
+func TestReadinessCheckHandler_AuditAndSpoolStatusAreIndependent(t *testing.T) {
+	resetReadinessState(t)
+	defer resetReadinessState(t)
+
+	SetReadinessSpoolStatus(func() SpoolStatus {
+		return SpoolStatus{Depth: 1, MaxDepth: 1000, OldestPendingAge: time.Second, HasPending: true}
+	})
+	SetReadinessAuditStatus(func() AuditStatus {
+		return AuditStatus{ConsecutiveFailures: DefaultReadinessMaxAuditFailures}
+	})
+
+	resp, body := doReadinessCheck(t)
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Errorf("status code = %d, want 503 (audit alone should be enough to flip unhealthy)", resp.StatusCode)
+	}
+	if body["spool_depth"].(float64) != 1 {
+		t.Errorf("expected healthy spool state to still be reported, got spool_depth=%v", body["spool_depth"])
 	}
 }
 

@@ -86,6 +86,7 @@ services:
       # section.
       - READINESS_MAX_DEPTH_RATIO=${READINESS_MAX_DEPTH_RATIO:-0.95}
       - READINESS_MAX_STALENESS_SECONDS=${READINESS_MAX_STALENESS_SECONDS:-900}
+      - READINESS_MAX_AUDIT_FAILURES=${READINESS_MAX_AUDIT_FAILURES:-3}
       # Durable egress audit log: a record of every CONFIRMED delivery,
       # separate from the spool (which deletes on success). Empty by
       # default (audit trail disabled, logged loudly at startup) - set

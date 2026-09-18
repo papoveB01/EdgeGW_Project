@@ -243,3 +243,52 @@ func TestRecord_FilePermissions(t *testing.T) {
 		t.Errorf("audit file perm = %o, want 0600", perm)
 	}
 }
+
+// TestNew_FailsFastOnUnwritableDirectory pins the startup writability probe:
+// os.MkdirAll alone would succeed silently against an already-existing but
+// read-only directory (e.g. a misconfigured read-only bind mount), and the
+// problem would otherwise only surface at the first CONFIRMED delivery -
+// after the destination has already accepted the signal. New must instead
+// fail immediately, the same way every other required-but-misconfigured
+// setting fails at startup rather than at first use.
+func TestNew_FailsFastOnUnwritableDirectory(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("running as root: permission bits don't block root's writes, so this probe can't be exercised")
+	}
+
+	parent := t.TempDir()
+	dir := filepath.Join(parent, "readonly-audit")
+	if err := os.Mkdir(dir, 0o700); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	t.Cleanup(func() { os.Chmod(dir, 0o700) }) // so t.TempDir() cleanup can remove it
+	if err := os.Chmod(dir, 0o500); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+
+	_, err := New(dir, false)
+	if err == nil {
+		t.Fatal("expected New to fail against a read-only directory, not silently succeed and fail later at first delivery")
+	}
+}
+
+// TestNew_SucceedsOnWritableDirectory is TestNew_FailsFastOnUnwritableDirectory's
+// counterpart: the probe must not be a false positive against an ordinary,
+// genuinely writable directory.
+func TestNew_SucceedsOnWritableDirectory(t *testing.T) {
+	dir := t.TempDir()
+	l, err := New(dir, false)
+	if err != nil {
+		t.Fatalf("expected New to succeed against a writable directory, got: %v", err)
+	}
+	t.Cleanup(func() { l.Close() })
+
+	// The probe file must not be left behind.
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("readdir: %v", err)
+	}
+	for _, e := range entries {
+		t.Errorf("expected no leftover files after New, found %s", e.Name())
+	}
+}

@@ -83,7 +83,7 @@ Send `national_id` (and `counterparty_national_id` on transfers) whenever availa
 | Endpoint | Method | Description |
 |----------|--------|-------------|
 | `/health` | GET | **Liveness** only: 200 whenever this process can serve HTTP, full stop. It never inspects the spool, so a full or stale spool during a destination outage — which a restart cannot fix — still reports healthy. This is what the Docker healthcheck (and the binary's `-healthcheck` self-probe) calls, and it is the **only** one of these three endpoints safe to wire to an auto-restart action (a Kubernetes `livenessProbe`, Swarm, an autoheal sidecar, etc). |
-| `/readyz` | GET | **Readiness/degradation**, not liveness: reports whether the gateway is keeping up, not just alive. Returns `503` with a `reasons` list when a registered spool is at/near capacity (see `READINESS_MAX_DEPTH_RATIO`) or its oldest pending signal has aged past a staleness threshold (see `READINESS_MAX_STALENESS_SECONDS`). A full or stale spool during a destination outage is the durable queue working as designed, not a dead process — restarting fixes neither the backlog (it survives on the spool volume) nor the outage, and would only add a self-inflicted `/process` outage on top. **Never wire this endpoint to an auto-restart action.** Wire it to alerting/paging, or, if used as a Kubernetes `readinessProbe`, to traffic removal only. |
+| `/readyz` | GET | **Readiness/degradation**, not liveness: reports whether the gateway is keeping up, not just alive. Returns `503` with a `reasons` list when a registered spool is at/near capacity (see `READINESS_MAX_DEPTH_RATIO`) or its oldest pending signal has aged past a staleness threshold (see `READINESS_MAX_STALENESS_SECONDS`), or when the egress audit log (see [Egress audit log](#egress-audit-log)) has failed to write for `READINESS_MAX_AUDIT_FAILURES` consecutive confirmed deliveries. A full or stale spool, or a stuck audit log, during a destination outage is the durable queue (or the compliance record of it) working as designed, not a dead process — restarting fixes none of it, and would only add a self-inflicted `/process` outage on top. **Never wire this endpoint to an auto-restart action.** Wire it to alerting/paging, or, if used as a Kubernetes `readinessProbe`, to traffic removal only. |
 | `/metrics` | GET | Operational metrics (signals processed, spool depth and age of oldest pending item, delivery failures and latency, uptime). Because egress to the destination is one-way, this and `/readyz` are the only way to tell a feed running hours behind from a healthy one. |
 | `/process` | POST | Accept raw transaction, anonymize, deliver to Hub (requires `INBOUND_API_KEY` when set). With `SPOOL_DIR` set: persists the anonymized signal and returns **202 Accepted**; a background forwarder delivers it. Without: forwards synchronously and returns 200 (or 502 on failure). |
 
@@ -179,14 +179,40 @@ digest-only, because the payload is pseudonymized but still personal data,
 and a second copy is a second liability. Audit files are written `0o600`
 under a `0o700` directory.
 
-If the audit write fails immediately after the destination has already
-accepted a signal, the gateway reports failure rather than success — the
-spool retries the signal (in synchronous mode, whatever calls `/process`
-may retry it), which can cause the destination to receive a duplicate
-delivery. This is deliberate: for a compliance control, a duplicate
-delivery is a nuisance, but a signal that left the bank with no durable
-record of it is a silent gap in what an auditor can be shown. Watch the
-`audit_write_failures` counter on `/metrics` to catch this happening.
+**Startup writability check.** `EGRESS_AUDIT_DIR` is not just `mkdir -p`'d: the
+gateway writes, fsyncs and removes a small probe file in it before starting,
+so a read-only mount or wrong permissions fail loudly at boot — the same as
+every other required setting — instead of at the first confirmed delivery,
+by which point the destination has already accepted the signal.
+
+**If the audit write fails immediately after the destination has already
+accepted a signal**, the gateway reports failure rather than success. In
+spool mode the signal stays queued and is retried; in synchronous mode,
+whatever calls `/process` may retry it. Either way this can cause the
+destination to receive a duplicate delivery. This is deliberate: for a
+compliance control, a duplicate delivery is a nuisance, but a signal that
+left the bank with no durable record of it is a silent gap in what an
+auditor can be shown.
+
+**Bounding the duplicate stream.** A naive retry would re-POST the same
+signal to the destination on every spool retry — roughly every 30 seconds,
+indefinitely, for as long as the audit directory stays broken. For a vendor
+computing velocity/count features, that doesn't just waste calls, it
+corrupts their inference. The spool-mode wrapper avoids this: once a signal
+has been confirmed delivered, further retries caused only by the audit
+write failing do NOT redeliver it — they retry the audit write alone. The
+only remaining duplicate is a genuine process restart while stuck in that
+state (the in-memory "already delivered" marker doesn't survive it), which
+redelivers at most once more, not once every 30 seconds forever.
+
+**Escalation.** Watch the `audit_write_failures` counter on `/metrics` for
+every failed write. In addition, after `READINESS_MAX_AUDIT_FAILURES`
+consecutive audit-write failures (default: 3) on either delivery path,
+`/readyz` reports unhealthy with a distinct reason — this is synchronous
+mode's only automatic degradation signal, since it has no equivalent of the
+spool's own staleness check (every request there just gets a 502 after a
+delivery that already succeeded). As with spool degradation, **do not wire
+this to an auto-restart action** — see [API Endpoints](#api-endpoints).
 
 `EGRESS_AUDIT_DIR` is unset by default — audit logging is off, with a loud
 startup warning, mirroring `SPOOL_DIR`'s default-off behavior. This package
@@ -212,6 +238,7 @@ files accumulate until an operator archives or deletes them.
 | `EGRESS_AUDIT_STORE_PAYLOAD` | No | Set to `true` to store the full delivered payload alongside its digest in the audit log (default: digest-only) |
 | `READINESS_MAX_DEPTH_RATIO` | No | Fraction of `SPOOL_MAX_DEPTH` at/above which `/readyz` reports unhealthy (default: `0.95`). See [API Endpoints](#api-endpoints) — this must never be wired to an auto-restart action. |
 | `READINESS_MAX_STALENESS_SECONDS` | No | How old (in seconds) the oldest pending spool item may get before `/readyz` reports unhealthy (default: `900`, i.e. 15 minutes) |
+| `READINESS_MAX_AUDIT_FAILURES` | No | Consecutive egress-audit-log write failures (either delivery path) before `/readyz` reports unhealthy (default: `3`). See [Egress audit log](#egress-audit-log). |
 | `GATEWAY_PORT` | No | Server port (default: 8080) |
 | `REPORTING_THRESHOLD` | No | AML reporting limit (default: 10000) |
 | `CONFIG_PATH` | No | Path to config JSON file (default: /config/gateway.json) |

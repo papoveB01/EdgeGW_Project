@@ -118,21 +118,48 @@ func ForwardPayload(ctx context.Context, payload []byte) error {
 // Worst case with maxRetries=2: 3 x 2.5s attempts + 0.25s + 0.5s backoff = 8.25s,
 // inside the server's 10s WriteTimeout.
 func ForwardToHubWithRetry(ctx context.Context, signal interface{}, maxRetries int) error {
+	return forwardWithRetry(ctx, maxRetries, func(ctx context.Context) error {
+		return ForwardToHub(ctx, signal)
+	})
+}
+
+// ForwardPayloadWithRetry is ForwardToHubWithRetry's counterpart for an
+// already-marshaled payload: the same bounded exponential-backoff retry,
+// but without marshaling per attempt - every attempt sends the exact same
+// bytes, guaranteed by construction rather than by signal being immutable
+// between attempts. This matters for callers (cmd/gateway's synchronous
+// egress-audit path) that need "the bytes we hash for a compliance record"
+// and "the bytes we actually transmitted" to be the same bytes
+// structurally, not just incidentally so long as nothing mutates signal in
+// between marshals.
+func ForwardPayloadWithRetry(ctx context.Context, payload []byte, maxRetries int) error {
+	return forwardWithRetry(ctx, maxRetries, func(ctx context.Context) error {
+		return ForwardPayload(ctx, payload)
+	})
+}
+
+// forwardWithRetry runs attempt with the same bounded exponential backoff
+// (250ms, 500ms, ...) ForwardToHubWithRetry has always used, stopping early
+// on context cancellation or a permanent error, and recording
+// signals_forwarded on eventual success. Shared by ForwardToHubWithRetry
+// and ForwardPayloadWithRetry, which differ only in what "one attempt"
+// means (marshal-then-send a signal, or send already-marshaled bytes).
+func forwardWithRetry(ctx context.Context, maxRetries int, attempt func(ctx context.Context) error) error {
 	var lastErr error
-	for attempt := 0; attempt <= maxRetries; attempt++ {
-		if attempt > 0 {
-			backoff := time.Duration(250<<uint(attempt-1)) * time.Millisecond
-			slog.Warn("Retrying hub forward", "attempt", attempt, "backoff", backoff.String())
+	for i := 0; i <= maxRetries; i++ {
+		if i > 0 {
+			backoff := time.Duration(250<<uint(i-1)) * time.Millisecond
+			slog.Warn("Retrying hub forward", "attempt", i, "backoff", backoff.String())
 			select {
 			case <-ctx.Done():
-				return fmt.Errorf("cancelled before retry %d: %w", attempt, ctx.Err())
+				return fmt.Errorf("cancelled before retry %d: %w", i, ctx.Err())
 			case <-time.After(backoff):
 			}
 		}
-		lastErr = ForwardToHub(ctx, signal)
+		lastErr = attempt(ctx)
 		if lastErr == nil {
-			if attempt > 0 {
-				slog.Info("Hub forward succeeded after retry", "attempt", attempt)
+			if i > 0 {
+				slog.Info("Hub forward succeeded after retry", "attempt", i)
 			}
 			RecordMetric("signals_forwarded", 1)
 			return nil
@@ -141,7 +168,7 @@ func ForwardToHubWithRetry(ctx context.Context, signal interface{}, maxRetries i
 			slog.Warn("Hub forward failed permanently, not retrying", "error", lastErr)
 			return lastErr
 		}
-		slog.Warn("Hub forward failed", "attempt", attempt, "error", lastErr)
+		slog.Warn("Hub forward failed", "attempt", i, "error", lastErr)
 	}
 	return fmt.Errorf("all %d attempts failed: %w", maxRetries+1, lastErr)
 }

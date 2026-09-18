@@ -49,18 +49,24 @@ services:
       # ─── Local params (managed by the bank, never sent externally) ─
       # INSTITUTION_ID/BANK_SALT are required in BOTH modes, so they keep
       # ${VAR:?...} - an empty value is never acceptable for them.
-      # MOSAIC_PEPPER is optional when MOSAIC_KEYING=bank (the default) and
-      # required when MOSAIC_KEYING=regional (main.validateStartup fails
-      # fast at startup if it's unset in that mode) - unlike
-      # INSTITUTION_ID/BANK_SALT, an empty value here is fine in the
-      # default mode, so this keeps the no-colon ${VAR?...} form. Set
-      # MOSAIC_PEPPER= (present, but blank) in .env to run with bank
-      # keying and no pepper. REGIONAL_PEPPER is accepted as a
-      # backward-compatible alias for this variable by the application
-      # (not by this compose file).
+      #
+      # MOSAIC_PEPPER/REGIONAL_PEPPER: the application (pepperEnv() in
+      # cmd/gateway/main.go) reads MOSAIC_PEPPER first and falls back to
+      # REGIONAL_PEPPER as a backward-compatible alias, so BOTH names must
+      # actually reach the container for that fallback to do anything -
+      # forwarding only one of them silently drops whichever one an
+      # existing deployment's .env happens to set. Passed through plainly
+      # with ${VAR:-} (no requiredness at the compose level): whether a
+      # pepper is required at all depends on MOSAIC_KEYING (required when
+      # =regional, optional when =bank, the default), which this compose
+      # file can't express with ${VAR?...}/${VAR:?...} - that condition is
+      # enforced at the application level instead (main.validateStartup
+      # fails startup fast when MOSAIC_KEYING=regional and neither is set).
+      # If both are set, MOSAIC_PEPPER wins, matching pepperEnv().
       - INSTITUTION_ID=${INSTITUTION_ID:?Set INSTITUTION_ID}
       - BANK_SALT=${BANK_SALT:?Set BANK_SALT (min 32 chars)}
-      - MOSAIC_PEPPER=${MOSAIC_PEPPER?Set MOSAIC_PEPPER (required when MOSAIC_KEYING=regional; optional, may be left blank, when MOSAIC_KEYING=bank - the default)}
+      - MOSAIC_PEPPER=${MOSAIC_PEPPER:-}
+      - REGIONAL_PEPPER=${REGIONAL_PEPPER:-}
 
       # ─── Standalone mode only (ignored in middleware mode) ─────────
       - STANDALONE_SINK_DIR=${STANDALONE_SINK_DIR:-/sink}

@@ -44,14 +44,24 @@ running gateway (defaults to `http://localhost:8080`).
 CI (`.github/workflows/ci.yml`) runs vet, race tests with coverage, a build, and
 a Docker build on Go 1.24. Match that toolchain version.
 
-Minimum env to run locally: `INSTITUTION_ID`, `API_KEY`, `HMAC_SECRET`,
-`BANK_SALT` — `main` exits 1 if any of those is missing. `MOSAIC_PEPPER` (or
-its backward-compatible alias `REGIONAL_PEPPER`) is only required when
-`MOSAIC_KEYING=regional`; it's optional in the default `MOSAIC_KEYING=bank`.
-`HUB_API_URL` is documented as required but is **not** enforced: `config.Load()`
-substitutes a default before the check in `main` runs, making that check dead
-code, so a gateway with no `HUB_API_URL` starts happily and posts to a
-placeholder host.
+Minimum env to run locally (default `GATEWAY_MODE=middleware`):
+`INSTITUTION_ID`, `API_KEY`, `HMAC_SECRET`, `HUB_API_URL`, `BANK_SALT` —
+`main` exits 1 if any of those is missing (`GATEWAY_MODE=standalone` needs
+neither `API_KEY`/`HMAC_SECRET`/`HUB_API_URL`, just `INSTITUTION_ID`/
+`BANK_SALT`). `MOSAIC_PEPPER` (or its backward-compatible alias
+`REGIONAL_PEPPER`) is only required when `MOSAIC_KEYING=regional`; it's
+optional in the default `MOSAIC_KEYING=bank`.
+`HUB_API_URL` genuinely has no built-in default and is genuinely enforced:
+`config.Load()` deliberately leaves `HubEndpointURL` empty rather than
+substituting a placeholder (see the doc comment on that in
+`internal/config/config.go`), and `validateStartup` in `main.go` rejects an
+unset value in middleware mode — `TestLoad_DefaultsWithoutFile` and
+`TestValidateStartup_MiddlewareFailsFastWithoutDestination` both assert
+this. (An earlier version of this file claimed the opposite — that the
+check was dead code and a gateway would silently POST to a placeholder
+host — but that was fixed before this repo's mosaic-v3 rekey landed;
+double-check current behavior against the code rather than assuming this
+paragraph stays accurate indefinitely.)
 
 Nothing loads `.env` — `make run` is a bare `go run`, and there is no dotenv
 dependency. Export the vars into your shell yourself. Add `SPOOL_DIR` to

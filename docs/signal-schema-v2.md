@@ -11,11 +11,13 @@ new mosaic scopes.
 
 ```json
 {
+  "signal_id": "3fa85f64-5717-4562-b3fc-2c963f66afa6",
   "institution_id": "BNK_EXAMPLE",
   "signal_type": "transaction",
   "identity_mosaic": "d433f5d2a3aedcb9…64 hex chars",
   "mosaic_scope": "global",
   "mosaic_version": 2,
+  "feature_version": 1,
   "timestamp": "2026-01-15T14:00:00Z",
   "metadata": {
     "amount_tier": "TIER_3",
@@ -47,9 +49,32 @@ new mosaic scopes.
 | Cross-bank matchability | Broken (bank salt in every mosaic) | Works for `mosaic_scope: "global"` |
 | `mosaic_scope` | absent | **new, always present**: `"global"` or `"local"` |
 | `mosaic_version` | absent | **new, always present**: `2` |
+| `signal_id` | absent | **new, always present**: unique per event, see below |
+| `feature_version` | absent | **new, always present**: see below |
 | `destination_mosaic_scope` | absent | new, present iff `destination_mosaic` is |
 | Timestamp | bucketed, timezone lost | RFC 3339, normalized to UTC, 15-min bucket |
 | `location_zone` | always a geohash (0,0 fabricated when unknown) | geohash-5 or `ZONE_UNKNOWN` |
+
+## `signal_id` — per-event correlation ID
+
+`identity_mosaic` is stable per *person* across every transaction, so on its
+own it cannot join a single event to anything. `signal_id` is unique per
+*event*: either the caller-supplied `transaction_ref` from the inbound
+request (trimmed; blank/whitespace-only is treated as absent), or, when not
+supplied, a randomly generated UUIDv4 (`crypto/rand`, never derived from any
+PII field). Consumers that need to correlate a downstream result back to a
+specific transaction — e.g. a fraud-scoring result returned out-of-band by an
+external system — should key that join on `signal_id`, not `identity_mosaic`.
+
+## `feature_version` — versioned feature-shape contract
+
+`feature_version` (currently `1`) identifies the shape of the derived,
+model-facing fields inside `metadata`: `amount_tier` boundaries (500 / 2500 /
+10000), the 15-minute timestamp bucket width, and the geohash precision (5)
+behind `location_zone`. A consumer whose model was fit to a specific
+`feature_version`'s boundaries must detect and handle a version bump before
+trusting new signals — these boundaries can change independently of
+`mosaic_version`, since they don't affect mosaic derivation at all.
 
 v1 and v2 mosaics never collide meaningfully — the derivations differ — so
 during migration the Hub should partition matching by `mosaic_version`

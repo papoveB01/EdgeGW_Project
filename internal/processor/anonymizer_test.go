@@ -128,6 +128,8 @@ func TestValidate(t *testing.T) {
 		{"lat without lon", func(r *RawData) { r.Longitude = nil }},
 		{"lat out of range", func(r *RawData) { r.Latitude = f64(95) }},
 		{"lon out of range", func(r *RawData) { r.Longitude = f64(-190) }},
+		{"unknown signal_type", func(r *RawData) { r.SignalType = "behavioural_profile" }},
+		{"unknown endpoint_type", func(r *RawData) { r.EndpointType = "SMART_FRIDGE" }},
 	}
 	for _, tc := range cases {
 		r := valid
@@ -291,5 +293,185 @@ func TestAnonymizeSignal_DeviceAndIPHash(t *testing.T) {
 	}
 	if sig2.Metadata["ip_hash"] != "prehashed_ip" {
 		t.Error("pre-hashed ip_hash should pass through")
+	}
+}
+
+func TestValidate_SignalTypeAllowlist(t *testing.T) {
+	base := RawData{ID: "1", Name: "Test", Account: "ACC", Amount: 100, Timestamp: "2026-01-15T14:07:33Z"}
+
+	tests := []struct {
+		name       string
+		signalType string
+		wantErr    bool
+	}{
+		{"empty defaults, allowed", "", false},
+		{"known: transaction", "transaction", false},
+		{"known: login", "login", false},
+		{"known: transfer", "transfer", false},
+		{"known: authentication", "authentication", false},
+		{"unknown value rejected", "general_behaviour", true},
+		{"case mismatch rejected", "Transaction", true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r := base
+			r.SignalType = tt.signalType
+			err := r.Validate()
+			if tt.wantErr && err == nil {
+				t.Errorf("signal_type %q: expected validation error, got nil", tt.signalType)
+			}
+			if !tt.wantErr && err != nil {
+				t.Errorf("signal_type %q: unexpected validation error: %v", tt.signalType, err)
+			}
+			if tt.wantErr {
+				var ve *ValidationError
+				if !isValidationError(err, &ve) {
+					t.Fatalf("signal_type %q: expected *ValidationError, got %T", tt.signalType, err)
+				}
+				if ve.Field != "signal_type" {
+					t.Errorf("signal_type %q: expected error field %q, got %q", tt.signalType, "signal_type", ve.Field)
+				}
+			}
+		})
+	}
+}
+
+func TestValidate_EndpointTypeAllowlist(t *testing.T) {
+	base := RawData{ID: "1", Name: "Test", Account: "ACC", Amount: 100, Timestamp: "2026-01-15T14:07:33Z"}
+
+	tests := []struct {
+		name         string
+		endpointType string
+		wantErr      bool
+	}{
+		{"empty is allowed", "", false},
+		{"known: MOBILE_APP", "MOBILE_APP", false},
+		{"known: ATM", "ATM", false},
+		{"known: POS", "POS", false},
+		{"known: WEB", "WEB", false},
+		{"known: BRANCH", "BRANCH", false},
+		{"known: API", "API", false},
+		{"unknown value rejected", "SMART_FRIDGE", true},
+		{"case mismatch rejected", "mobile_app", true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r := base
+			r.EndpointType = tt.endpointType
+			err := r.Validate()
+			if tt.wantErr && err == nil {
+				t.Errorf("endpoint_type %q: expected validation error, got nil", tt.endpointType)
+			}
+			if !tt.wantErr && err != nil {
+				t.Errorf("endpoint_type %q: unexpected validation error: %v", tt.endpointType, err)
+			}
+			if tt.wantErr {
+				var ve *ValidationError
+				if !isValidationError(err, &ve) {
+					t.Fatalf("endpoint_type %q: expected *ValidationError, got %T", tt.endpointType, err)
+				}
+				if ve.Field != "endpoint_type" {
+					t.Errorf("endpoint_type %q: expected error field %q, got %q", tt.endpointType, "endpoint_type", ve.Field)
+				}
+			}
+		})
+	}
+}
+
+// isValidationError type-asserts err into a *ValidationError, storing it into
+// *out and reporting whether the assertion succeeded.
+func isValidationError(err error, out **ValidationError) bool {
+	ve, ok := err.(*ValidationError)
+	if ok {
+		*out = ve
+	}
+	return ok
+}
+
+func TestAnonymizeSignal_SignalIDUniqueAcrossCalls(t *testing.T) {
+	raw := RawData{ID: "1", Name: "Test", Account: "ACC", Amount: 100, Timestamp: "2026-01-01T00:00:00Z"}
+
+	seen := make(map[string]bool)
+	const n = 200
+	for i := 0; i < n; i++ {
+		sig := AnonymizeSignal(raw, "BNK", "salt", "pepper", 10000)
+		if sig.SignalID == "" {
+			t.Fatal("expected a non-empty signal_id")
+		}
+		if seen[sig.SignalID] {
+			t.Fatalf("signal_id collision across calls: %s", sig.SignalID)
+		}
+		seen[sig.SignalID] = true
+	}
+
+	// Not derived from PII: identical input, different national ID must not
+	// change the fact that every call still gets its own fresh signal_id
+	// (already covered above), and the identity mosaic (which IS derived
+	// from PII/config) must differ from the signal_id in shape/value.
+	sig := AnonymizeSignal(raw, "BNK", "salt", "pepper", 10000)
+	if sig.SignalID == sig.IdentityMosaic {
+		t.Error("signal_id must not equal identity_mosaic")
+	}
+}
+
+func TestAnonymizeSignal_SignalIDHonoursCallerRef(t *testing.T) {
+	raw := RawData{ID: "1", Name: "Test", Account: "ACC", Amount: 100, Timestamp: "2026-01-01T00:00:00Z",
+		TransactionRef: "core-banking-ref-88421"}
+
+	sig := AnonymizeSignal(raw, "BNK", "salt", "pepper", 10000)
+	if sig.SignalID != "core-banking-ref-88421" {
+		t.Errorf("expected signal_id to honour caller-supplied transaction_ref, got %q", sig.SignalID)
+	}
+
+	// Whitespace-only ref is treated as absent, same as the other optional
+	// string fields' "must be usable, not just present" validation style.
+	rawBlank := raw
+	rawBlank.TransactionRef = "   "
+	sigBlank := AnonymizeSignal(rawBlank, "BNK", "salt", "pepper", 10000)
+	if sigBlank.SignalID == "" || sigBlank.SignalID == "   " {
+		t.Errorf("blank transaction_ref should fall back to a generated signal_id, got %q", sigBlank.SignalID)
+	}
+
+	// Two calls with no ref supplied must not collide with each other or
+	// with the caller-supplied one above.
+	rawNoRef := raw
+	rawNoRef.TransactionRef = ""
+	sigA := AnonymizeSignal(rawNoRef, "BNK", "salt", "pepper", 10000)
+	sigB := AnonymizeSignal(rawNoRef, "BNK", "salt", "pepper", 10000)
+	if sigA.SignalID == sigB.SignalID {
+		t.Error("generated signal_id must differ across calls even with identical input")
+	}
+	if sigA.SignalID == sig.SignalID || sigB.SignalID == sig.SignalID {
+		t.Error("generated signal_id must not collide with a caller-supplied transaction_ref")
+	}
+}
+
+func TestNewSignalID(t *testing.T) {
+	a := NewSignalID()
+	b := NewSignalID()
+	if a == b {
+		t.Fatal("NewSignalID must not repeat across calls")
+	}
+	// UUIDv4 shape: 8-4-4-4-12 hex, version nibble 4, variant nibble 8-b.
+	if len(a) != 36 {
+		t.Fatalf("expected 36-char UUID-shaped id, got %d: %q", len(a), a)
+	}
+	if a[14] != '4' {
+		t.Errorf("expected UUID version nibble '4', got %q in %q", a[14], a)
+	}
+	if a[19] != '8' && a[19] != '9' && a[19] != 'a' && a[19] != 'b' {
+		t.Errorf("expected UUID variant nibble in [89ab], got %q in %q", a[19], a)
+	}
+}
+
+func TestAnonymizeSignal_FeatureVersionEmitted(t *testing.T) {
+	raw := RawData{ID: "1", Name: "Test", Account: "ACC", Amount: 100, Timestamp: "2026-01-01T00:00:00Z"}
+	sig := AnonymizeSignal(raw, "BNK", "salt", "pepper", 10000)
+
+	if sig.FeatureVersion != FeatureVersion {
+		t.Errorf("expected feature_version %d, got %d", FeatureVersion, sig.FeatureVersion)
+	}
+	if sig.FeatureVersion == 0 {
+		t.Error("feature_version must be a positive, explicit version, not the zero value")
 	}
 }

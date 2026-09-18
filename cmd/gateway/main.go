@@ -250,6 +250,7 @@ func processTransaction(sp *spool.Spool) http.HandlerFunc {
 			w.WriteHeader(http.StatusAccepted)
 			json.NewEncoder(w).Encode(map[string]interface{}{
 				"status":          "queued",
+				"signal_id":       anonymized.SignalID,
 				"identity_mosaic": anonymized.IdentityMosaic[:16] + "...",
 				"mosaic_scope":    anonymized.MosaicScope,
 				"spool_depth":     sp.Depth(),
@@ -286,6 +287,7 @@ func processTransaction(sp *spool.Spool) http.HandlerFunc {
 		json.NewEncoder(w).Encode(map[string]interface{}{
 			"status":             "processed",
 			"processing_time_ms": processingTime.Milliseconds(),
+			"signal_id":          anonymized.SignalID,
 			"identity_mosaic":    anonymized.IdentityMosaic[:16] + "...",
 			"mosaic_scope":       anonymized.MosaicScope,
 		})

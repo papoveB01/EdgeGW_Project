@@ -91,13 +91,21 @@ services:
       # and accepted the risk - see README's "Durable spool" section and
       # .env.example.
       - SPOOL_FSYNC=${SPOOL_FSYNC:-true}
-      # Readiness thresholds for /readyz (spool backlog/staleness). This is
-      # NOT the liveness endpoint the healthcheck below calls - /readyz must
-      # never be wired to an auto-restart action; see README's API Endpoints
-      # section.
+      # Readiness thresholds for /readyz (spool backlog/staleness, and
+      # persistent spool-directory fsync failures - see
+      # READINESS_MAX_SPOOL_FSYNC_FAILURES below). This is NOT the liveness
+      # endpoint the healthcheck below calls - /readyz must never be wired
+      # to an auto-restart action; see README's API Endpoints section.
       - READINESS_MAX_DEPTH_RATIO=${READINESS_MAX_DEPTH_RATIO:-0.95}
       - READINESS_MAX_STALENESS_SECONDS=${READINESS_MAX_STALENESS_SECONDS:-900}
       - READINESS_MAX_AUDIT_FAILURES=${READINESS_MAX_AUDIT_FAILURES:-3}
+      # Consecutive Enqueue post-rename spool-directory fsync failures
+      # before /readyz reports unhealthy. A persistent (not just
+      # transient) failure here still means every signal is queuing and
+      # delivering correctly (see README's "Durable spool" section) - this
+      # turns it into an alertable degraded state instead of an unbounded
+      # stream of spurious 500s from /process.
+      - READINESS_MAX_SPOOL_FSYNC_FAILURES=${READINESS_MAX_SPOOL_FSYNC_FAILURES:-3}
       # Durable egress audit log: a record of every CONFIRMED delivery,
       # separate from the spool (which deletes on success). Empty by
       # default (audit trail disabled, logged loudly at startup) - set

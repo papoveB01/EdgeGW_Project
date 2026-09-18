@@ -82,6 +82,18 @@ type SpoolStatus struct {
 	MaxDepth         int
 	OldestPendingAge time.Duration
 	HasPending       bool
+	// ConsecutiveDirFsyncFailures is spool.Spool.DirFsyncFailures(): how
+	// many of Enqueue's post-rename spool-directory fsyncs have failed in
+	// a row since the last one that succeeded. A transient failure here
+	// is expected (Enqueue still returns an error for it, matching the
+	// duplicate-over-missing precedent in cmd/gateway/audit.go), but a
+	// PERSISTENT one - a degraded volume that still permits writes and
+	// renames but not directory metadata syncs - would otherwise produce
+	// an unbounded stream of spurious 500s (and possibly duplicate
+	// signals, if the caller retries on 500) for a condition that isn't
+	// actually losing data. See ReadinessCheckHandler for how this
+	// becomes a distinct, alertable /readyz reason instead.
+	ConsecutiveDirFsyncFailures int
 }
 
 // SpoolStatusFunc returns a live SpoolStatus snapshot. Implementations must
@@ -113,12 +125,13 @@ type AuditStatus struct {
 type AuditStatusFunc func() AuditStatus
 
 var (
-	readinessMu               sync.RWMutex
-	readinessSpoolStatus      SpoolStatusFunc // nil in synchronous mode (no spool)
-	readinessAuditStatus      AuditStatusFunc // nil when no audit log is configured
-	readinessMaxDepthRatio    = DefaultReadinessMaxDepthRatio
-	readinessMaxStaleness     = DefaultReadinessMaxStaleness
-	readinessMaxAuditFailures = DefaultReadinessMaxAuditFailures
+	readinessMu                    sync.RWMutex
+	readinessSpoolStatus           SpoolStatusFunc // nil in synchronous mode (no spool)
+	readinessAuditStatus           AuditStatusFunc // nil when no audit log is configured
+	readinessMaxDepthRatio         = DefaultReadinessMaxDepthRatio
+	readinessMaxStaleness          = DefaultReadinessMaxStaleness
+	readinessMaxAuditFailures      = DefaultReadinessMaxAuditFailures
+	readinessMaxSpoolFsyncFailures = DefaultReadinessMaxSpoolFsyncFailures
 )
 
 // DefaultReadinessMaxAuditFailures is how many consecutive egress-audit-log
@@ -130,6 +143,17 @@ var (
 // have already left the bank with no compliance record of it - that is
 // worth escalating quickly, not waiting out like an ordinary backlog.
 const DefaultReadinessMaxAuditFailures = 3
+
+// DefaultReadinessMaxSpoolFsyncFailures is how many consecutive Enqueue
+// post-rename spool-directory fsync failures ReadinessCheckHandler
+// tolerates before reporting unhealthy. Mirrors
+// DefaultReadinessMaxAuditFailures: same small threshold, same rationale -
+// by the time this trips, the spool's own durability guarantee for
+// recently-accepted signals (the 202 meaning "survives host power loss")
+// has been silently false for several signals in a row, and every one of
+// those Enqueue calls has already returned a failure to its caller - that
+// is worth escalating quickly, not waiting out like an ordinary backlog.
+const DefaultReadinessMaxSpoolFsyncFailures = 3
 
 // SetReadinessSpoolStatus registers the callback ReadinessCheckHandler uses
 // to read live spool state. Passing nil (the default) means there is no
@@ -176,6 +200,18 @@ func SetReadinessMaxAuditFailures(n int) {
 	}
 }
 
+// SetReadinessMaxSpoolFsyncFailures configures the consecutive-spool-
+// directory-fsync-failure threshold ReadinessCheckHandler uses. A
+// non-positive value is ignored, leaving the current value (default
+// DefaultReadinessMaxSpoolFsyncFailures) in place.
+func SetReadinessMaxSpoolFsyncFailures(n int) {
+	readinessMu.Lock()
+	defer readinessMu.Unlock()
+	if n > 0 {
+		readinessMaxSpoolFsyncFailures = n
+	}
+}
+
 // ReadinessCheckHandler reports whether the gateway is keeping up, not just
 // alive: if a spool is registered (async mode) and it is at or near
 // capacity, or its oldest pending signal has aged past the staleness
@@ -183,7 +219,13 @@ func SetReadinessMaxAuditFailures(n int) {
 // the same when an egress audit log is registered (EGRESS_AUDIT_DIR) and
 // its consecutive-write-failure count has crossed its threshold - see
 // AuditStatus's doc comment for why synchronous mode especially needs this
-// (it has no staleness signal of its own).
+// (it has no staleness signal of its own). It does the same again when a
+// registered spool's consecutive directory-fsync failures (SpoolStatus.
+// ConsecutiveDirFsyncFailures) cross READINESS_MAX_SPOOL_FSYNC_FAILURES -
+// see that field's doc comment for why a persistent (not just transient)
+// failure there needs its own distinct, alertable signal rather than
+// showing up only as an unbounded stream of Enqueue/processTransaction
+// errors.
 //
 // A full or stale spool during a vendor outage is the durable queue working
 // exactly as designed — it is a DEGRADED condition, not a dead process. The
@@ -209,6 +251,7 @@ func ReadinessCheckHandler(w http.ResponseWriter, r *http.Request) {
 	staleness := readinessMaxStaleness
 	auditFn := readinessAuditStatus
 	maxAuditFailures := readinessMaxAuditFailures
+	maxSpoolFsyncFailures := readinessMaxSpoolFsyncFailures
 	readinessMu.RUnlock()
 
 	body := map[string]interface{}{
@@ -230,6 +273,10 @@ func ReadinessCheckHandler(w http.ResponseWriter, r *http.Request) {
 			if st.OldestPendingAge > staleness {
 				reasons = append(reasons, "oldest pending signal exceeds staleness threshold")
 			}
+		}
+		body["spool_dir_fsync_consecutive_failures"] = st.ConsecutiveDirFsyncFailures
+		if st.ConsecutiveDirFsyncFailures >= maxSpoolFsyncFailures {
+			reasons = append(reasons, "spool directory fsync has failed for too many consecutive enqueues")
 		}
 	}
 	if auditFn != nil {

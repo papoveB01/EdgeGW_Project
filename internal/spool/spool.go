@@ -59,6 +59,18 @@ type Hooks struct {
 	// OnOldestPendingAge fires whenever the age of the oldest pending item
 	// is recomputed. ageSeconds is 0 when the queue is empty.
 	OnOldestPendingAge func(ageSeconds float64)
+	// OnDirFsyncFailure fires every time Enqueue's post-rename spool
+	// directory fsync fails (see Enqueue's doc comment on why that
+	// failure deliberately does NOT roll back the already-committed
+	// signal). A transient failure here is expected to self-heal; a
+	// persistent one - a degraded volume that still permits writes and
+	// renames but not directory metadata syncs - would otherwise produce
+	// an unbounded stream of spurious Enqueue errors with no distinct
+	// signal of its own (see DirFsyncFailures, which callers should pair
+	// with this hook: the hook drives a raw counter like
+	// spool_dir_fsync_failures on /metrics, DirFsyncFailures drives the
+	// alertable consecutive-failure condition on /readyz).
+	OnDirFsyncFailure func()
 }
 
 // Spool is a durable oldest-first delivery queue.
@@ -74,6 +86,17 @@ type Spool struct {
 	seq             uint64
 	oldestPendingAt time.Time // zero value means no pending signal
 	wake            chan struct{}
+	// dirFsyncFailures counts consecutive Enqueue post-rename directory
+	// fsync failures, resetting to 0 on the next directory fsync that
+	// succeeds. It exists so a persistent (not merely transient) failure
+	// of this specific step - which Enqueue deliberately does NOT roll
+	// back, see Enqueue's doc comment - becomes an alertable /readyz
+	// condition (via DirFsyncFailures, surfaced through
+	// adapters.SpoolStatus.ConsecutiveDirFsyncFailures) instead of a
+	// silent, unbounded stream of 500s to the caller. Guarded by mu like
+	// every other bookkeeping field here, and - like depth - only ever
+	// mutated outside the disk-I/O section of Enqueue, never across it.
+	dirFsyncFailures int
 
 	// fsyncEnabled controls whether Enqueue fsyncs the temp file before
 	// rename and the spool directory after it, so a 202 Accepted means
@@ -141,6 +164,19 @@ func (s *Spool) MaxDepth() int {
 // fsyncEnabledFromEnv's parsing rules.
 func (s *Spool) FsyncEnabled() bool {
 	return s.fsyncEnabled
+}
+
+// DirFsyncFailures reports the number of consecutive Enqueue post-rename
+// directory fsync failures since the last one that succeeded (0 when
+// healthy, or unconditionally when SPOOL_FSYNC=false since that step never
+// runs). Reads only cached in-memory state (no disk I/O), so it is cheap
+// enough for a readiness check to poll on every request - see
+// ReadinessCheckHandler's doc comment in internal/adapters/inbound.go and
+// this field's DirFsyncFailures-adjacent doc comment on the struct.
+func (s *Spool) DirFsyncFailures() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.dirFsyncFailures
 }
 
 // OldestPendingAge reports how long the oldest pending signal has been
@@ -226,10 +262,57 @@ func (s *Spool) Enqueue(payload []byte) error {
 			// produce a duplicate signal once this one is eventually
 			// delivered - an accepted cost, the same tradeoff this
 			// codebase already makes for audit-log writes.
-			return fmt.Errorf("failed to fsync spool directory: %w", err)
+			//
+			// A transient failure here is exactly the case above:
+			// correct to report as an error, no data at risk. A
+			// PERSISTENT failure (a degraded volume that still permits
+			// writes and renames but not directory metadata syncs) is a
+			// different problem: every subsequent Enqueue would return
+			// this same error indefinitely while every signal keeps
+			// queuing and delivering correctly - an unbounded stream of
+			// spurious 500s to the caller (and, if it retries on 500,
+			// an unbounded stream of duplicate signals to the vendor)
+			// for a condition that isn't losing any data. So this
+			// records a CONSECUTIVE failure count (reset on the next
+			// success, below) rather than just returning the error:
+			// DirFsyncFailures lets main.go surface it on /readyz as a
+			// distinct, alertable degraded state once it crosses
+			// READINESS_MAX_SPOOL_FSYNC_FAILURES, the same shape of fix
+			// READINESS_MAX_AUDIT_FAILURES already applies to a stuck
+			// egress audit log. This does NOT change Enqueue's error
+			// return here - the point is to make the condition visible,
+			// not to start silently accepting signals whose directory
+			// entry may not be durable.
+			n := s.recordDirFsyncFailure()
+			if s.hooks.OnDirFsyncFailure != nil {
+				s.hooks.OnDirFsyncFailure()
+			}
+			return fmt.Errorf("failed to fsync spool directory (consecutive failures: %d): %w", n, err)
 		}
+		s.recordDirFsyncSuccess()
 	}
 	return nil
+}
+
+// recordDirFsyncFailure increments the consecutive directory-fsync-failure
+// count and returns the new value. Called only from Enqueue, outside any
+// held lock other than the brief one taken here - never across disk I/O.
+func (s *Spool) recordDirFsyncFailure() int {
+	s.mu.Lock()
+	s.dirFsyncFailures++
+	n := s.dirFsyncFailures
+	s.mu.Unlock()
+	return n
+}
+
+// recordDirFsyncSuccess resets the consecutive directory-fsync-failure
+// count to 0. Called only from Enqueue after a directory fsync that
+// succeeds, so a run of failures doesn't keep inflating /readyz's reported
+// count once the underlying condition has actually cleared.
+func (s *Spool) recordDirFsyncSuccess() {
+	s.mu.Lock()
+	s.dirFsyncFailures = 0
+	s.mu.Unlock()
 }
 
 // writeTempFile creates tmp, writes payload, and - unless fsync is disabled

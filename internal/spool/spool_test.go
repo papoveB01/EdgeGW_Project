@@ -575,3 +575,154 @@ func TestEnqueue_DoesNotHoldMutexAcrossFsync(t *testing.T) {
 		t.Fatalf("Enqueue: %v", err)
 	}
 }
+
+// --- Consecutive directory-fsync-failure tracking: issue #15 --------------
+//
+// spool.Enqueue deliberately does not roll back a post-rename directory
+// fsync failure (see TestEnqueue_DirectoryFsyncFailureReturnsErrorButKeepsCommittedSignal
+// above), so a PERSISTENT failure of that one step - a degraded volume that
+// still permits writes and renames but not directory metadata syncs -
+// would otherwise produce an unbounded stream of spurious Enqueue errors
+// with no distinct signal of its own. These tests pin DirFsyncFailures()
+// (and the OnDirFsyncFailure hook that mirrors it for /metrics) as that
+// signal: it must count consecutive failures and - this is the specific
+// gap issue #10 flagged as missing test coverage for the audit-log
+// equivalent - reset to 0 the moment a directory fsync succeeds again.
+
+// TestEnqueue_DirFsyncFailuresIncrementsOnConsecutiveFailures pins the
+// counting half of the contract: each directory-fsync failure in a row
+// increments DirFsyncFailures() by exactly one, starting from 0.
+func TestEnqueue_DirFsyncFailuresIncrementsOnConsecutiveFailures(t *testing.T) {
+	dir := t.TempDir()
+	s, err := New(dir, 100, noopForward, isPerm, Hooks{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if got := s.DirFsyncFailures(); got != 0 {
+		t.Fatalf("DirFsyncFailures() before any failure = %d, want 0", got)
+	}
+
+	wantErr := errors.New("simulated directory fsync failure")
+	s.syncDir = func(d string) error { return wantErr }
+
+	for i, want := range []int{1, 2, 3} {
+		payload := []byte(fmt.Sprintf(`{"sig":%d}`, i))
+		if err := s.Enqueue(payload); err == nil {
+			t.Fatalf("enqueue %d: expected Enqueue to return an error", i)
+		} else if !errors.Is(err, wantErr) {
+			t.Errorf("enqueue %d: expected returned error to wrap the fsync error, got: %v", i, err)
+		}
+		if got := s.DirFsyncFailures(); got != want {
+			t.Errorf("enqueue %d: DirFsyncFailures() = %d, want %d", i, got, want)
+		}
+	}
+}
+
+// TestEnqueue_DirFsyncFailuresResetsOnSuccess pins the reset half of the
+// contract, which has no equivalent test for the audit-log consecutive-
+// failure counter today (see issue #10) - a directory fsync that succeeds
+// again must bring DirFsyncFailures() back to 0, not leave it stuck at
+// whatever count the prior failures reached, and a fresh failure after
+// that recovery must start counting from 1 again rather than resuming the
+// old streak.
+func TestEnqueue_DirFsyncFailuresResetsOnSuccess(t *testing.T) {
+	dir := t.TempDir()
+	s, err := New(dir, 100, noopForward, isPerm, Hooks{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	wantErr := errors.New("simulated directory fsync failure")
+	s.syncDir = func(d string) error { return wantErr }
+
+	for i := 0; i < 2; i++ {
+		payload := []byte(fmt.Sprintf(`{"sig":%d}`, i))
+		if err := s.Enqueue(payload); err == nil {
+			t.Fatalf("enqueue %d: expected Enqueue to return an error", i)
+		}
+	}
+	if got := s.DirFsyncFailures(); got != 2 {
+		t.Fatalf("DirFsyncFailures() after 2 consecutive failures = %d, want 2", got)
+	}
+
+	// "Disk" recovers: the next directory fsync succeeds.
+	s.syncDir = func(d string) error { return nil }
+	if err := s.Enqueue([]byte(`{"sig":"recovered"}`)); err != nil {
+		t.Fatalf("expected Enqueue to succeed once the directory fsync recovers, got: %v", err)
+	}
+	if got := s.DirFsyncFailures(); got != 0 {
+		t.Errorf("DirFsyncFailures() after a successful directory fsync = %d, want 0 (must reset, not just stop growing)", got)
+	}
+
+	// A fresh failure after recovery must count from 1, not resume the
+	// pre-reset streak (which would make DirFsyncFailures() = 3 here).
+	s.syncDir = func(d string) error { return wantErr }
+	if err := s.Enqueue([]byte(`{"sig":"fails-again"}`)); err == nil {
+		t.Fatal("expected Enqueue to return an error")
+	}
+	if got := s.DirFsyncFailures(); got != 1 {
+		t.Errorf("DirFsyncFailures() after one fresh failure post-reset = %d, want 1", got)
+	}
+}
+
+// TestEnqueue_OnDirFsyncFailureHookFiresOnlyOnFailure pins the
+// OnDirFsyncFailure hook's wiring: it must fire once per directory-fsync
+// failure (this is what main.go wires to the spool_dir_fsync_failures
+// /metrics counter) and must NOT fire on a successful Enqueue, including
+// one that follows a run of failures.
+func TestEnqueue_OnDirFsyncFailureHookFiresOnlyOnFailure(t *testing.T) {
+	dir := t.TempDir()
+	var hookCalls atomic.Int32
+	s, err := New(dir, 100, noopForward, isPerm, Hooks{
+		OnDirFsyncFailure: func() { hookCalls.Add(1) },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	wantErr := errors.New("simulated directory fsync failure")
+	s.syncDir = func(d string) error { return wantErr }
+
+	for i := 0; i < 3; i++ {
+		payload := []byte(fmt.Sprintf(`{"sig":%d}`, i))
+		if err := s.Enqueue(payload); err == nil {
+			t.Fatalf("enqueue %d: expected Enqueue to return an error", i)
+		}
+	}
+	if got := hookCalls.Load(); got != 3 {
+		t.Fatalf("expected OnDirFsyncFailure to fire 3 times after 3 failures, got %d", got)
+	}
+
+	s.syncDir = func(d string) error { return nil }
+	if err := s.Enqueue([]byte(`{"sig":"ok"}`)); err != nil {
+		t.Fatalf("expected Enqueue to succeed, got: %v", err)
+	}
+	if got := hookCalls.Load(); got != 3 {
+		t.Errorf("expected OnDirFsyncFailure NOT to fire on a successful Enqueue, total calls = %d, want 3", got)
+	}
+}
+
+// TestEnqueue_DirFsyncFailuresZeroWhenFsyncDisabled checks that
+// SPOOL_FSYNC=false (fsyncEnabled=false) never touches the counter at
+// all - the directory-fsync step never runs in that mode, so there is
+// nothing to count, and a stray nonzero reading here would be a false
+// degraded signal on /readyz for operators who deliberately opted out.
+func TestEnqueue_DirFsyncFailuresZeroWhenFsyncDisabled(t *testing.T) {
+	dir := t.TempDir()
+	s, err := New(dir, 100, noopForward, isPerm, Hooks{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.fsyncEnabled = false
+	// Even if syncDir were somehow invoked and failing, disabling fsync
+	// means Enqueue must never call it.
+	s.syncDir = func(d string) error { return errors.New("should never be called") }
+
+	if err := s.Enqueue([]byte(`{"sig":1}`)); err != nil {
+		t.Fatalf("expected Enqueue to succeed with fsync disabled, got: %v", err)
+	}
+	if got := s.DirFsyncFailures(); got != 0 {
+		t.Errorf("DirFsyncFailures() with fsync disabled = %d, want 0", got)
+	}
+}

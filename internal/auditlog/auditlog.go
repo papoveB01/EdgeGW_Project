@@ -219,18 +219,14 @@ func (l *Logger) Record(destination, signalID string, mosaicVersion, featureVers
 		}
 		path := filepath.Join(l.dir, "audit-"+day+".ndjson")
 
-		// Determine BEFORE opening whether this call is about to create a
-		// new file, so the directory fsync below only fires on creation,
-		// never on an ordinary re-open of a day file that already exists
-		// (e.g. a process restart on the same UTC day). If Stat fails for
-		// any reason other than "doesn't exist" (permission error, races,
-		// etc.), fail safe toward treating it as a possible creation
-		// rather than skipping a directory fsync that might be needed —
-		// the extra fsync is cheap once per day file; a missed one is not.
-		_, statErr := os.Stat(path)
-		creating := statErr != nil
-
-		f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+		// dirsync.OpenAppendFile atomically determines, via O_EXCL, both
+		// whether this call is about to create a new file AND creates it
+		// in the same syscall — see its doc comment for why a separate
+		// os.Stat-then-Open here would be racy across multiple writers
+		// sharing this directory (not this project's deployment model
+		// today, but not something this code should silently assume
+		// either).
+		f, creating, err := dirsync.OpenAppendFile(path, 0o600)
 		if err != nil {
 			l.f = nil
 			return fmt.Errorf("failed to open audit log file: %w", err)

@@ -79,14 +79,14 @@ func (s *localSink) Forward(_ context.Context, payload []byte) error {
 		}
 		path := filepath.Join(s.dir, "signals-"+day+".ndjson")
 
-		// See the same "determine before opening" reasoning in
-		// internal/auditlog.Logger.Record: this must only fire on actual
-		// creation, not on every re-open of an already-existing day file
-		// (e.g. after a process restart on the same UTC day).
-		_, statErr := os.Stat(path)
-		creating := statErr != nil
-
-		f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+		// dirsync.OpenAppendFile atomically determines, via O_EXCL, both
+		// whether this call is about to create a new file AND creates it
+		// in the same syscall — see its doc comment for why a separate
+		// os.Stat-then-Open here would be racy across multiple writers
+		// sharing this directory (not this project's deployment model
+		// today, but not something this code should silently assume
+		// either).
+		f, creating, err := dirsync.OpenAppendFile(path, 0o600)
 		if err != nil {
 			s.f = nil
 			return fmt.Errorf("failed to open sink file: %w", err)

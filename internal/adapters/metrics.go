@@ -2,6 +2,7 @@ package adapters
 
 import (
 	"encoding/json"
+	"math"
 	"net/http"
 	"sync"
 	"sync/atomic"
@@ -22,7 +23,37 @@ var (
 	// gauge so /metrics can compute "seconds since" at scrape time instead
 	// of exposing a value that goes stale the instant it's set.
 	lastDeliveryUnixNano atomic.Int64
+
+	// deliveryLatencyEWMABitsMs holds math.Float64bits of an exponentially
+	// weighted moving average of delivery latency, in milliseconds. Unlike
+	// the lifetime sum/count average below, this tracks *recent* deliveries
+	// so a fresh incident (e.g. the vendor slowing down) moves it quickly
+	// instead of being diluted by hours of prior fast deliveries.
+	deliveryLatencyEWMABitsMs atomic.Uint64
 )
+
+// deliveryLatencyEWMAAlpha is the weight given to each new latency sample.
+// Higher = more reactive to recent deliveries, lower = smoother. 0.2 means
+// roughly the last ~5 deliveries dominate the average.
+const deliveryLatencyEWMAAlpha = 0.2
+
+// updateDeliveryLatencyEWMA folds one new latency sample (in milliseconds)
+// into the running exponentially weighted moving average. It's lock-free
+// (CAS retry loop) so concurrent deliveries never lose an update, and never
+// blocks the delivery path on a mutex.
+func updateDeliveryLatencyEWMA(sampleMs float64) {
+	for {
+		oldBits := deliveryLatencyEWMABitsMs.Load()
+		next := sampleMs
+		if oldBits != 0 {
+			old := math.Float64frombits(oldBits)
+			next = deliveryLatencyEWMAAlpha*sampleMs + (1-deliveryLatencyEWMAAlpha)*old
+		}
+		if deliveryLatencyEWMABitsMs.CompareAndSwap(oldBits, math.Float64bits(next)) {
+			return
+		}
+	}
+}
 
 // RecordMetric increments a named counter.
 func RecordMetric(name string, value int64) {
@@ -66,13 +97,17 @@ func SetGauge(name string, value int64) {
 // metrics: time-since-last-successful-delivery and delivery latency
 // (queueTime is how long the signal waited between being accepted and being
 // confirmed delivered; pass 0 when latency isn't known, e.g. synchronous
-// forwarding with no queue).
+// forwarding with no queue). It updates both a lifetime cumulative latency
+// average (for capacity planning) and a short-window EWMA (for spotting a
+// fresh slowdown quickly) — see MetricsHandler for how each is exposed.
 func RecordDelivery(queueTime time.Duration) {
 	lastDeliveryUnixNano.Store(time.Now().UnixNano())
 	RecordMetric("signals_forwarded", 1)
 	if queueTime > 0 {
-		RecordMetric("delivery_latency_ms_sum", queueTime.Milliseconds())
+		ms := queueTime.Milliseconds()
+		RecordMetric("delivery_latency_ms_sum", ms)
 		RecordMetric("delivery_latency_count", 1)
+		updateDeliveryLatencyEWMA(float64(ms))
 	}
 }
 
@@ -109,7 +144,14 @@ func MetricsHandler(w http.ResponseWriter, r *http.Request) {
 		result["seconds_since_last_delivery"] = nil
 	}
 	if latencyCount > 0 {
-		result["delivery_latency_ms_avg"] = float64(latencySum) / float64(latencyCount)
+		// Lifetime cumulative average: useful for capacity planning, but an
+		// incident buried under hours of prior fast deliveries barely moves
+		// it — see delivery_latency_ms_ewma for a metric that reacts to
+		// current conditions.
+		result["delivery_latency_ms_lifetime_avg"] = float64(latencySum) / float64(latencyCount)
+		if ewmaBits := deliveryLatencyEWMABitsMs.Load(); ewmaBits != 0 {
+			result["delivery_latency_ms_ewma"] = math.Float64frombits(ewmaBits)
+		}
 	}
 
 	w.Header().Set("Content-Type", "application/json")

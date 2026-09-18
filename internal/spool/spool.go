@@ -281,11 +281,24 @@ func (s *Spool) reportDepth() {
 // updateOldestPending caches the enqueue time of the head of the pending
 // list (pending must already be sorted oldest-first, as listPending
 // returns) and reports it via OnOldestPendingAge. Callers must not hold s.mu.
+//
+// If the head's filename can't be parsed (it should always be one this
+// package wrote, but disk state can surprise you), this deliberately fails
+// toward "assume stale" rather than toward "no pending": a freshness signal
+// that silently reports an item as not-pending because its timestamp was
+// unreadable would hide a real backlog from staleness alerting, which is
+// the wrong direction to fail in. So an unparseable name gets the Unix
+// epoch as its enqueue time, guaranteeing a large, alarm-tripping age
+// instead of a reassuring zero.
 func (s *Spool) updateOldestPending(pending []string) {
 	var t time.Time
 	if len(pending) > 0 {
 		if parsed, ok := parseSpoolTime(pending[0]); ok {
 			t = parsed
+		} else {
+			slog.Warn("Unparseable spool filename, reporting oldest-pending age conservatively (assumed stale)",
+				"file", pending[0])
+			t = time.Unix(0, 0)
 		}
 	}
 	s.mu.Lock()

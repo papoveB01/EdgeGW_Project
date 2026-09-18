@@ -45,15 +45,15 @@ func TestProcessInboundRequest_Rejects(t *testing.T) {
 	}
 }
 
-// resetHealthState restores HealthCheckHandler's package-level state to its
-// defaults so tests don't leak configuration into each other.
-func resetHealthState(t *testing.T) {
+// resetReadinessState restores ReadinessCheckHandler's package-level state
+// to its defaults so tests don't leak configuration into each other.
+func resetReadinessState(t *testing.T) {
 	t.Helper()
-	SetHealthSpoolStatus(nil)
-	SetHealthThresholds(DefaultHealthMaxDepthRatio, DefaultHealthMaxStaleness)
+	SetReadinessSpoolStatus(nil)
+	SetReadinessThresholds(DefaultReadinessMaxDepthRatio, DefaultReadinessMaxStaleness)
 }
 
-func doHealthCheck(t *testing.T) (*http.Response, map[string]interface{}) {
+func doLivenessCheck(t *testing.T) (*http.Response, map[string]interface{}) {
 	t.Helper()
 	req := httptest.NewRequest("GET", "/health", nil)
 	w := httptest.NewRecorder()
@@ -66,11 +66,53 @@ func doHealthCheck(t *testing.T) (*http.Response, map[string]interface{}) {
 	return resp, body
 }
 
-func TestHealthCheckHandler_HealthyWithoutSpool(t *testing.T) {
-	resetHealthState(t)
-	defer resetHealthState(t)
+func doReadinessCheck(t *testing.T) (*http.Response, map[string]interface{}) {
+	t.Helper()
+	req := httptest.NewRequest("GET", "/readyz", nil)
+	w := httptest.NewRecorder()
+	ReadinessCheckHandler(w, req)
+	resp := w.Result()
+	var body map[string]interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatalf("failed to decode readiness response: %v", err)
+	}
+	return resp, body
+}
 
-	resp, body := doHealthCheck(t)
+// TestHealthCheckHandler_AlwaysHealthyRegardlessOfSpoolState pins /health as
+// a pure liveness check: it must return 200 no matter how degraded a
+// registered spool is, because restarting the process can't fix a backlog
+// (it survives on the spool volume) or a downed vendor, and would only add
+// a self-inflicted /process outage. This is a regression guard against
+// re-coupling liveness and degradation on this handler.
+func TestHealthCheckHandler_AlwaysHealthyRegardlessOfSpoolState(t *testing.T) {
+	resetReadinessState(t)
+	defer resetReadinessState(t)
+
+	// Register a spool state that would make ReadinessCheckHandler report
+	// unhealthy (near capacity AND stale) to prove HealthCheckHandler
+	// ignores it entirely.
+	SetReadinessSpoolStatus(func() SpoolStatus {
+		return SpoolStatus{Depth: 999, MaxDepth: 1000, OldestPendingAge: 24 * time.Hour, HasPending: true}
+	})
+
+	resp, body := doLivenessCheck(t)
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("status code = %d, want 200 (liveness must not 503 on spool state)", resp.StatusCode)
+	}
+	if body["status"] != "healthy" {
+		t.Errorf("status = %v, want healthy", body["status"])
+	}
+	if _, present := body["spool_depth"]; present {
+		t.Error("liveness response should not carry spool details")
+	}
+}
+
+func TestHealthCheckHandler_HealthyWithoutSpool(t *testing.T) {
+	resetReadinessState(t)
+	defer resetReadinessState(t)
+
+	resp, body := doLivenessCheck(t)
 	if resp.StatusCode != http.StatusOK {
 		t.Errorf("status code = %d, want 200", resp.StatusCode)
 	}
@@ -79,15 +121,28 @@ func TestHealthCheckHandler_HealthyWithoutSpool(t *testing.T) {
 	}
 }
 
-func TestHealthCheckHandler_HealthyWithSpoolWithinThresholds(t *testing.T) {
-	resetHealthState(t)
-	defer resetHealthState(t)
+func TestReadinessCheckHandler_HealthyWithoutSpool(t *testing.T) {
+	resetReadinessState(t)
+	defer resetReadinessState(t)
 
-	SetHealthSpoolStatus(func() SpoolStatus {
+	resp, body := doReadinessCheck(t)
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("status code = %d, want 200", resp.StatusCode)
+	}
+	if body["status"] != "healthy" {
+		t.Errorf("status = %v, want healthy", body["status"])
+	}
+}
+
+func TestReadinessCheckHandler_HealthyWithSpoolWithinThresholds(t *testing.T) {
+	resetReadinessState(t)
+	defer resetReadinessState(t)
+
+	SetReadinessSpoolStatus(func() SpoolStatus {
 		return SpoolStatus{Depth: 5, MaxDepth: 1000, OldestPendingAge: 2 * time.Minute, HasPending: true}
 	})
 
-	resp, body := doHealthCheck(t)
+	resp, body := doReadinessCheck(t)
 	if resp.StatusCode != http.StatusOK {
 		t.Errorf("status code = %d, want 200", resp.StatusCode)
 	}
@@ -99,15 +154,15 @@ func TestHealthCheckHandler_HealthyWithSpoolWithinThresholds(t *testing.T) {
 	}
 }
 
-func TestHealthCheckHandler_UnhealthyWhenSpoolNearCapacity(t *testing.T) {
-	resetHealthState(t)
-	defer resetHealthState(t)
+func TestReadinessCheckHandler_UnhealthyWhenSpoolNearCapacity(t *testing.T) {
+	resetReadinessState(t)
+	defer resetReadinessState(t)
 
-	SetHealthSpoolStatus(func() SpoolStatus {
+	SetReadinessSpoolStatus(func() SpoolStatus {
 		return SpoolStatus{Depth: 960, MaxDepth: 1000, OldestPendingAge: time.Second, HasPending: true}
 	})
 
-	resp, body := doHealthCheck(t)
+	resp, body := doReadinessCheck(t)
 	if resp.StatusCode != http.StatusServiceUnavailable {
 		t.Errorf("status code = %d, want 503", resp.StatusCode)
 	}
@@ -119,15 +174,15 @@ func TestHealthCheckHandler_UnhealthyWhenSpoolNearCapacity(t *testing.T) {
 	}
 }
 
-func TestHealthCheckHandler_UnhealthyWhenStale(t *testing.T) {
-	resetHealthState(t)
-	defer resetHealthState(t)
+func TestReadinessCheckHandler_UnhealthyWhenStale(t *testing.T) {
+	resetReadinessState(t)
+	defer resetReadinessState(t)
 
-	SetHealthSpoolStatus(func() SpoolStatus {
+	SetReadinessSpoolStatus(func() SpoolStatus {
 		return SpoolStatus{Depth: 3, MaxDepth: 1000, OldestPendingAge: time.Hour, HasPending: true}
 	})
 
-	resp, body := doHealthCheck(t)
+	resp, body := doReadinessCheck(t)
 	if resp.StatusCode != http.StatusServiceUnavailable {
 		t.Errorf("status code = %d, want 503", resp.StatusCode)
 	}
@@ -136,18 +191,18 @@ func TestHealthCheckHandler_UnhealthyWhenStale(t *testing.T) {
 	}
 }
 
-func TestHealthCheckHandler_ThresholdsAreConfigurable(t *testing.T) {
-	resetHealthState(t)
-	defer resetHealthState(t)
+func TestReadinessCheckHandler_ThresholdsAreConfigurable(t *testing.T) {
+	resetReadinessState(t)
+	defer resetReadinessState(t)
 
 	// A depth that would be fine under the default 95% ratio but breaches a
 	// tighter, explicitly configured 50% ratio.
-	SetHealthThresholds(0.5, DefaultHealthMaxStaleness)
-	SetHealthSpoolStatus(func() SpoolStatus {
+	SetReadinessThresholds(0.5, DefaultReadinessMaxStaleness)
+	SetReadinessSpoolStatus(func() SpoolStatus {
 		return SpoolStatus{Depth: 600, MaxDepth: 1000, OldestPendingAge: time.Second, HasPending: true}
 	})
 
-	resp, body := doHealthCheck(t)
+	resp, body := doReadinessCheck(t)
 	if resp.StatusCode != http.StatusServiceUnavailable {
 		t.Errorf("status code = %d, want 503", resp.StatusCode)
 	}
@@ -156,15 +211,15 @@ func TestHealthCheckHandler_ThresholdsAreConfigurable(t *testing.T) {
 	}
 }
 
-func TestHealthCheckHandler_NoPendingSkipsStalenessCheck(t *testing.T) {
-	resetHealthState(t)
-	defer resetHealthState(t)
+func TestReadinessCheckHandler_NoPendingSkipsStalenessCheck(t *testing.T) {
+	resetReadinessState(t)
+	defer resetReadinessState(t)
 
-	SetHealthSpoolStatus(func() SpoolStatus {
+	SetReadinessSpoolStatus(func() SpoolStatus {
 		return SpoolStatus{Depth: 0, MaxDepth: 1000, HasPending: false}
 	})
 
-	resp, body := doHealthCheck(t)
+	resp, body := doReadinessCheck(t)
 	if resp.StatusCode != http.StatusOK {
 		t.Errorf("status code = %d, want 200", resp.StatusCode)
 	}
@@ -202,12 +257,48 @@ func TestMetricsHandler_DeliveryFreshness(t *testing.T) {
 		t.Errorf("seconds_since_last_delivery = %v, want a small non-negative value", since)
 	}
 
-	avgRaw, ok := body["delivery_latency_ms_avg"]
+	avgRaw, ok := body["delivery_latency_ms_lifetime_avg"]
 	if !ok {
-		t.Fatal("expected delivery_latency_ms_avg to be present")
+		t.Fatal("expected delivery_latency_ms_lifetime_avg to be present")
 	}
-	avg := avgRaw.(float64)
-	if avg != 400 {
-		t.Errorf("delivery_latency_ms_avg = %v, want 400 (avg of 200ms and 600ms)", avg)
+	if _, ok := body["delivery_latency_ms_ewma"]; !ok {
+		t.Fatal("expected delivery_latency_ms_ewma to be present")
+	}
+	_ = avgRaw // exact value depends on other tests' cumulative deliveries; see the dedicated EWMA test below.
+}
+
+// TestMetricsHandler_DeliveryLatencyEWMAReactsFasterThanLifetimeAverage
+// demonstrates why delivery_latency_ms_ewma exists: delivery_latency_ms_
+// lifetime_avg is a cumulative average that a long history of fast
+// deliveries can permanently dilute, so a fresh incident barely moves it —
+// defeating early detection of degradation. The EWMA must react strongly to
+// a recent spike instead.
+func TestMetricsHandler_DeliveryLatencyEWMAReactsFasterThanLifetimeAverage(t *testing.T) {
+	// A long run of fast deliveries, standing in for hours of healthy
+	// operation that would otherwise swamp a cumulative average.
+	for i := 0; i < 50; i++ {
+		RecordDelivery(10 * time.Millisecond)
+	}
+	// A sudden incident: one much slower delivery.
+	RecordDelivery(2000 * time.Millisecond)
+
+	req := httptest.NewRequest("GET", "/metrics", nil)
+	w := httptest.NewRecorder()
+	MetricsHandler(w, req)
+
+	var body map[string]interface{}
+	if err := json.NewDecoder(w.Result().Body).Decode(&body); err != nil {
+		t.Fatalf("failed to decode metrics response: %v", err)
+	}
+
+	ewma := body["delivery_latency_ms_ewma"].(float64)
+	lifetimeAvg := body["delivery_latency_ms_lifetime_avg"].(float64)
+
+	if ewma < 200 {
+		t.Errorf("delivery_latency_ms_ewma = %v, want it to react strongly to the recent 2000ms spike", ewma)
+	}
+	if ewma <= lifetimeAvg {
+		t.Errorf("expected the EWMA (%v) to sit well above the lifetime average (%v) right after a spike, "+
+			"otherwise the EWMA isn't adding early-detection value over the cumulative average", ewma, lifetimeAvg)
 	}
 }

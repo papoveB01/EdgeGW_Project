@@ -3,6 +3,7 @@ package spool
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sync/atomic"
@@ -231,6 +232,91 @@ func TestOldestPendingAge(t *testing.T) {
 		_, hasPending := s.OldestPendingAge(time.Now())
 		return !hasPending
 	})
+}
+
+// TestOldestPendingAgeSurvivesRestart pins the headline correctness claim of
+// this package's freshness work: age-of-oldest-pending must be recovered
+// from the filename-embedded enqueue timestamp on restart, not reset to
+// zero just because the in-process Spool that did the enqueuing is gone.
+// New() calling listPending() then updateOldestPending() is what makes that
+// work; this test would fail if that wiring were ever dropped (e.g. by
+// someone "simplifying" New()), even though every other test in this file
+// would stay green.
+//
+// The file is backdated on disk (not slept for) so the test stays fast and
+// deterministic.
+func TestOldestPendingAgeSurvivesRestart(t *testing.T) {
+	dir := t.TempDir()
+	block := func(ctx context.Context, payload []byte) error { return errors.New("down") }
+
+	s1, err := New(dir, 100, block, isPerm, Hooks{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s1.Enqueue([]byte(`{"sig":1}`)); err != nil {
+		t.Fatal(err)
+	}
+	// No Run: simulate a crash with the signal still sitting on disk.
+
+	pending, err := s1.listPending()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pending) != 1 {
+		t.Fatalf("expected 1 pending file before backdating, got %d: %v", len(pending), pending)
+	}
+	// Rewrite the filename's embedded unixnano timestamp to 2 hours in the
+	// past, matching the "<zero-padded unixnano>-<seq>.json" scheme.
+	backdated := time.Now().Add(-2 * time.Hour)
+	newName := fmt.Sprintf("%020d-%06d.json", backdated.UnixNano(), 1)
+	if err := os.Rename(filepath.Join(dir, pending[0]), filepath.Join(dir, newName)); err != nil {
+		t.Fatal(err)
+	}
+
+	// Open a NEW Spool over the same directory, simulating a process
+	// restart. The old Spool (s1) is abandoned, never delivered anything.
+	s2, err := New(dir, 100, block, isPerm, Hooks{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	age, hasPending := s2.OldestPendingAge(time.Now())
+	if !hasPending {
+		t.Fatal("a fresh Spool over a directory with a pending file should report it as pending")
+	}
+	if age < 90*time.Minute || age > 150*time.Minute {
+		t.Errorf("OldestPendingAge = %v, want ~2h recovered from the backdated filename; "+
+			"a value near 0 means restart recovery is broken (age reset instead of recovered)", age)
+	}
+}
+
+// TestOldestPendingAgeFailsConservativelyOnUnparseableFilename covers the
+// fallback for a spool file whose name doesn't match the
+// "<unixnano>-<seq>.json" scheme (shouldn't happen from this package's own
+// writes, but disk state can surprise you). A freshness signal must fail
+// toward "assume stale", not toward "no pending" — silently reporting no
+// backlog because a timestamp was unreadable would hide a real one from
+// staleness alerting.
+func TestOldestPendingAgeFailsConservativelyOnUnparseableFilename(t *testing.T) {
+	dir := t.TempDir()
+	block := func(ctx context.Context, payload []byte) error { return errors.New("down") }
+
+	if err := os.WriteFile(filepath.Join(dir, "not-a-valid-spool-name.json"), []byte(`{"sig":1}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	s, err := New(dir, 100, block, isPerm, Hooks{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	age, hasPending := s.OldestPendingAge(time.Now())
+	if !hasPending {
+		t.Fatal("an unparseable pending file must still report hasPending=true, not disappear from the signal")
+	}
+	if age < 24*time.Hour {
+		t.Errorf("age = %v, want a large conservative age (assumed stale), not something small enough to look fresh", age)
+	}
 }
 
 func TestEnqueueFullReturnsErrFull(t *testing.T) {

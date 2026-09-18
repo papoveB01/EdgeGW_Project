@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 )
 
@@ -28,8 +29,29 @@ type LocalParams struct {
 
 // GatewayConfig combines Hub and local configuration.
 type GatewayConfig struct {
+	// Mode selects the deployment topology: ModeMiddleware (default, current
+	// behavior) forwards anonymized signals to an external vendor platform;
+	// ModeStandalone runs with no external system and requires none of the
+	// Hub/vendor credentials.
+	Mode  string      `json:"mode"`
 	Hub   HubParams   `json:"hub"`
 	Local LocalParams `json:"local"`
+}
+
+const (
+	// ModeMiddleware forwards signals one-way to an external vendor fraud
+	// platform for inference only. This is the default, matching historical
+	// behavior of this gateway.
+	ModeMiddleware = "middleware"
+	// ModeStandalone runs the gateway independent of any external system;
+	// signals are written to a local durable sink instead of forwarded.
+	ModeStandalone = "standalone"
+)
+
+// IsStandalone reports whether the gateway is configured to run without any
+// external destination.
+func (c *GatewayConfig) IsStandalone() bool {
+	return c.Mode == ModeStandalone
 }
 
 var (
@@ -59,6 +81,7 @@ func Load() *GatewayConfig {
 	if f, err := os.Open(configPath); err == nil {
 		fileCfg := &GatewayConfig{}
 		if err := json.NewDecoder(f).Decode(fileCfg); err == nil {
+			cfg.Mode = fileCfg.Mode
 			cfg.Hub = fileCfg.Hub
 			cfg.Local.BankSalt = fileCfg.Local.BankSalt
 			if len(fileCfg.Local.InternalAdapterConfig) > 0 {
@@ -74,6 +97,9 @@ func Load() *GatewayConfig {
 	}
 
 	// 2. Environment variables override file values.
+	if v := os.Getenv("GATEWAY_MODE"); v != "" {
+		cfg.Mode = v
+	}
 	if v := os.Getenv("INSTITUTION_ID"); v != "" {
 		cfg.Hub.InstitutionID = v
 	}
@@ -97,8 +123,15 @@ func Load() *GatewayConfig {
 	}
 
 	// 3. Built-in defaults for anything still unset.
-	if cfg.Hub.HubEndpointURL == "" {
-		cfg.Hub.HubEndpointURL = "http://intel-api:8000/api/v1/signals"
+	//
+	// HubEndpointURL deliberately has NO built-in default: a placeholder here
+	// would make the "is a destination configured?" check in main.go
+	// unreachable dead code (a gateway with no real destination would start
+	// happily and POST to a fake host). Middleware mode requires it to be set
+	// explicitly; standalone mode doesn't need it at all.
+	cfg.Mode = strings.ToLower(strings.TrimSpace(cfg.Mode))
+	if cfg.Mode == "" {
+		cfg.Mode = ModeMiddleware
 	}
 	if cfg.Local.LocalLogRetentionDays <= 0 {
 		cfg.Local.LocalLogRetentionDays = 90

@@ -56,13 +56,73 @@ func TestLoad_DefaultsWithoutFile(t *testing.T) {
 
 	cfg := Reload()
 
-	if cfg.Hub.HubEndpointURL != "http://intel-api:8000/api/v1/signals" {
-		t.Errorf("expected built-in hub URL default, got %q", cfg.Hub.HubEndpointURL)
+	// HubEndpointURL must NOT get a built-in placeholder default: that would
+	// make the "is a destination configured?" startup check in main.go
+	// unreachable dead code, and a middleware gateway with no real
+	// destination would start happily and POST to a fake host.
+	if cfg.Hub.HubEndpointURL != "" {
+		t.Errorf("expected no built-in hub URL default, got %q", cfg.Hub.HubEndpointURL)
 	}
 	if cfg.Local.ReportingThreshold != 10000 {
 		t.Errorf("expected default threshold 10000, got %v", cfg.Local.ReportingThreshold)
 	}
 	if cfg.Local.LocalLogRetentionDays != 90 {
 		t.Errorf("expected default retention 90, got %v", cfg.Local.LocalLogRetentionDays)
+	}
+}
+
+func TestLoad_ModeDefaultsToMiddleware(t *testing.T) {
+	t.Setenv("CONFIG_PATH", "/nonexistent/gateway.json")
+	t.Setenv("GATEWAY_MODE", "")
+	t.Cleanup(func() { Reload() })
+
+	cfg := Reload()
+
+	if cfg.Mode != ModeMiddleware {
+		t.Errorf("expected default mode %q, got %q", ModeMiddleware, cfg.Mode)
+	}
+	if cfg.IsStandalone() {
+		t.Errorf("middleware mode must not report IsStandalone()")
+	}
+}
+
+func TestLoad_ModeFromEnv_NormalizedCaseAndWhitespace(t *testing.T) {
+	t.Setenv("CONFIG_PATH", "/nonexistent/gateway.json")
+	t.Setenv("GATEWAY_MODE", "  Standalone  ")
+	t.Cleanup(func() { Reload() })
+
+	cfg := Reload()
+
+	if cfg.Mode != ModeStandalone {
+		t.Errorf("expected normalized mode %q, got %q", ModeStandalone, cfg.Mode)
+	}
+	if !cfg.IsStandalone() {
+		t.Errorf("expected IsStandalone() true for standalone mode")
+	}
+}
+
+func TestLoad_ModeEnvOverridesFile(t *testing.T) {
+	path := writeConfigFile(t, `{"mode": "standalone"}`)
+	t.Setenv("CONFIG_PATH", path)
+	t.Setenv("GATEWAY_MODE", "middleware")
+	t.Cleanup(func() { Reload() })
+
+	cfg := Reload()
+
+	if cfg.Mode != ModeMiddleware {
+		t.Errorf("env must override file mode: got %q", cfg.Mode)
+	}
+}
+
+func TestLoad_ModeFromFile(t *testing.T) {
+	path := writeConfigFile(t, `{"mode": "standalone"}`)
+	t.Setenv("CONFIG_PATH", path)
+	t.Setenv("GATEWAY_MODE", "")
+	t.Cleanup(func() { Reload() })
+
+	cfg := Reload()
+
+	if cfg.Mode != ModeStandalone {
+		t.Errorf("expected mode from file %q, got %q", ModeStandalone, cfg.Mode)
 	}
 }

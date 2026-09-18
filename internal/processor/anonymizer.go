@@ -297,7 +297,9 @@ type AnonymizedSignal struct {
 	// BANK_SALT, cannot invert it. When TransactionRef is absent, SignalID
 	// is AnonymizeSignal's fallbackSignalID parameter verbatim — by
 	// convention a random UUIDv4 the caller generated with NewSignalID()
-	// (see that parameter's doc comment on AnonymizeSignal).
+	// (see that parameter's doc comment on AnonymizeSignal) — or, if that
+	// parameter was left blank in violation of its precondition,
+	// MissingSignalIDSentinel.
 	SignalID       string `json:"signal_id"`
 	InstitutionID  string `json:"institution_id"`
 	SignalType     string `json:"signal_type"`
@@ -500,6 +502,50 @@ func newSignalIDFrom(read func([]byte) (int, error)) (string, error) {
 	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16]), nil
 }
 
+// NeedsFallbackSignalID reports whether ref (RawData.TransactionRef) is
+// absent — blank or whitespace-only counts as absent — and AnonymizeSignal
+// will therefore use its fallbackSignalID parameter instead of a
+// ref-derived signal_id.
+//
+// This is the single, exported definition of "absent" for this decision.
+// Both processTransaction (deciding whether it needs to call
+// genSignalID/NewSignalID before invoking AnonymizeSignal at all) and
+// AnonymizeSignal itself (deciding which branch to take) call this rather
+// than each independently re-implementing strings.TrimSpace(ref) == "".
+// Before this existed, the two copies of that check happened to agree but
+// nothing forced them to: no test drives a whitespace-only transaction_ref
+// through processTransaction end to end, so if one copy silently drifted
+// (e.g. someone dropped the TrimSpace on one side), fallbackSignalID would
+// never be generated, AnonymizeSignal would still think a ref was absent,
+// and signal_id would go out as "" in both the vendor payload and the
+// append-only audit record. One definition makes that drift impossible
+// rather than merely unlikely today.
+func NeedsFallbackSignalID(ref string) bool {
+	return strings.TrimSpace(ref) == ""
+}
+
+// MissingSignalIDSentinel is emitted as signal_id when NeedsFallbackSignalID
+// reports the reference absent AND the caller-supplied fallbackSignalID is
+// itself blank — a contract violation of AnonymizeSignal's fallbackSignalID
+// precondition (see that parameter's doc comment). This should be
+// unreachable via processTransaction, which always populates
+// fallbackSignalID via genSignalID/NewSignalID before calling
+// AnonymizeSignal whenever NeedsFallbackSignalID is true, and returns a 500
+// itself if that generation fails rather than calling AnonymizeSignal with
+// nothing. It exists as a last line of defense for any OTHER caller, a
+// future second entry point, or a mis-written test that skips that step.
+//
+// Deliberately NOT a panic: this exact code path used to panic (see
+// NewSignalID's history / https://github.com/papoveB01/EdgeGW_Project/issues/4),
+// which is precisely the failure mode this package is now trying to avoid
+// in the request path. An empty string here would be silently wrong — an
+// unusable, un-joinable signal_id that looks superficially valid in a JSON
+// payload or an audit record. This sentinel is deliberately loud instead:
+// greppable in the audit log and in any vendor-side join, so a caller bug
+// producing a blank fallback is an obvious, detectable evidentiary gap
+// rather than a silent one.
+const MissingSignalIDSentinel = "MISSING_SIGNAL_ID"
+
 // AnonymizeSignal processes raw PII data into an anonymized signal. It is a
 // pure function: for identical inputs (including fallbackSignalID) it
 // always produces an identical output, does no I/O, and never touches OS
@@ -507,23 +553,29 @@ func newSignalIDFrom(read func([]byte) (int, error)) (string, error) {
 // collisions.
 //
 // fallbackSignalID is used verbatim as the output SignalID only when
-// RawData.TransactionRef is absent (blank/whitespace-only counts as
-// absent) — when TransactionRef is supplied, fallbackSignalID is ignored
-// entirely and SignalID is deterministically derived from the reference
-// instead (see the SignalID field doc on AnonymizedSignal). The caller is
-// responsible for generating fallbackSignalID (normally via
-// processor.NewSignalID()) and for handling a crypto/rand failure BEFORE
-// calling AnonymizeSignal — that responsibility used to live inside this
-// function (NewSignalID was called directly from here), which made
-// AnonymizeSignal neither pure nor deterministic whenever TransactionRef
-// was absent, and made a broken OS entropy source panic deep inside a
-// "pure" function with no chance for the caller to turn it into a proper
-// HTTP error. Moving random-ID generation out to the caller (see
-// processTransaction in cmd/gateway/main.go) restores genuine purity here
-// and fixes that panic; see
-// https://github.com/papoveB01/EdgeGW_Project/issues/4. A caller with a
-// TransactionRef in hand may pass "" for fallbackSignalID, since it won't
-// be used.
+// NeedsFallbackSignalID(rawPii.TransactionRef) is true (TransactionRef
+// absent; blank/whitespace-only counts as absent) — when TransactionRef is
+// supplied, fallbackSignalID is ignored entirely and SignalID is
+// deterministically derived from the reference instead (see the SignalID
+// field doc on AnonymizedSignal). PRECONDITION: whenever
+// NeedsFallbackSignalID(rawPii.TransactionRef) is true, the caller must
+// supply a non-blank fallbackSignalID (normally via processor.NewSignalID(),
+// called BEFORE AnonymizeSignal so a crypto/rand failure can become a
+// proper HTTP error instead of reaching this function at all) — violating
+// that precondition does not panic or error, it produces
+// MissingSignalIDSentinel instead (see that constant's doc comment). A
+// caller with a TransactionRef in hand may pass "" for fallbackSignalID,
+// since it won't be used.
+//
+// This parameter (and the caller-side generation it implies) used to live
+// inside this function: NewSignalID was called directly from here, which
+// made AnonymizeSignal neither pure nor deterministic whenever
+// TransactionRef was absent, and made a broken OS entropy source panic
+// deep inside a "pure" function with no chance for the caller to turn it
+// into a proper HTTP error. Moving random-ID generation out to the caller
+// (see processTransaction in cmd/gateway/main.go) restores genuine purity
+// here and fixes that panic; see
+// https://github.com/papoveB01/EdgeGW_Project/issues/4.
 func AnonymizeSignal(rawPii RawData, institutionID string, salt string, pepper string, keying string, reportingThreshold float64, fallbackSignalID string) AnonymizedSignal {
 	// 1. Identity Mosaic (v3).
 	//
@@ -607,8 +659,12 @@ func AnonymizeSignal(rawPii RawData, institutionID string, salt string, pepper s
 	// must not collide onto the same signal_id. Hash the trimmed raw bytes
 	// instead — TransactionRef is case-sensitive and punctuation-sensitive.
 	var signalID string
-	if ref := strings.TrimSpace(rawPii.TransactionRef); ref != "" {
-		signalID = HMACHash(salt, "v2|sigid|"+ref)
+	if !NeedsFallbackSignalID(rawPii.TransactionRef) {
+		signalID = HMACHash(salt, "v2|sigid|"+strings.TrimSpace(rawPii.TransactionRef))
+	} else if strings.TrimSpace(fallbackSignalID) == "" {
+		// Contract violation guard — see MissingSignalIDSentinel's doc
+		// comment. Should be unreachable via processTransaction.
+		signalID = MissingSignalIDSentinel
 	} else {
 		signalID = fallbackSignalID
 	}

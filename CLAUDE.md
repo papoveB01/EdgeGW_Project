@@ -176,6 +176,19 @@ used to panic on `crypto/rand.Read` failure, which `net/http` recovered
 per-connection with no log line, no metric, and no HTTP status — see
 https://github.com/papoveB01/EdgeGW_Project/issues/4.
 
+"Is `transaction_ref` absent" (blank/whitespace-only counts as absent) has
+exactly one definition: `processor.NeedsFallbackSignalID`. Both
+`processTransaction` (deciding whether to call `genSignalID` at all) and
+`AnonymizeSignal` (deciding which `signal_id` branch to take) call it —
+don't reintroduce a second, independent `strings.TrimSpace(ref) == ""`
+check in either place, or the two can silently drift apart. If
+`AnonymizeSignal` is ever called with `NeedsFallbackSignalID` true and a
+blank `fallbackSignalID` anyway (a contract violation `processTransaction`
+itself can't produce, but a future caller might), it emits
+`processor.MissingSignalIDSentinel` (`"MISSING_SIGNAL_ID"`) rather than an
+empty string or a panic — loud and greppable in the vendor payload and the
+audit log, instead of a silent unusable join key.
+
 - **Bank-scoped mosaic (default, `KeyingBank`)** =
   `HMAC-SHA256(mosaicKeyMaterial(BANK_SALT, pepper), "v3|id|"+NormalizeID(national_id))`,
   where `mosaicKeyMaterial` folds the pepper in only when it's set (empty

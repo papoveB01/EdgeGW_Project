@@ -11,7 +11,6 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
-	"strings"
 	"syscall"
 	"time"
 
@@ -485,7 +484,8 @@ func healthcheck() int {
 // entropy source and exercise the 500 path deterministically, without
 // patching crypto/rand globally or resorting to unsafe tricks - the same
 // swappable-function approach processor.newSignalIDFrom uses internally.
-// Production code must never reassign this.
+// This is a testing seam, not something the compiler enforces: production
+// code should never reassign it.
 var genSignalID = processor.NewSignalID
 
 // processTransaction validates, anonymizes, and hands off one transaction.
@@ -525,12 +525,16 @@ func processTransaction(sp *spool.Spool, syncForward func(ctx context.Context, s
 		salt := cfg.Local.BankSalt
 
 		// AnonymizeSignal needs a random fallback signal_id only when the
-		// caller didn't supply transaction_ref (blank/whitespace-only counts
-		// as absent, matching AnonymizeSignal's own check) - generate it
-		// here, up front, so a crypto/rand failure surfaces as a normal
-		// request failure rather than a panic inside a "pure" function.
+		// caller didn't supply transaction_ref - generate it here, up
+		// front, so a crypto/rand failure surfaces as a normal request
+		// failure rather than a panic inside a "pure" function.
+		// processor.NeedsFallbackSignalID is the single, shared definition
+		// of "absent" (blank/whitespace-only counts as absent) - both this
+		// check and AnonymizeSignal's internal branch call it, so the two
+		// can't independently drift out of agreement. See that function's
+		// doc comment.
 		var fallbackSignalID string
-		if strings.TrimSpace(rawData.TransactionRef) == "" {
+		if processor.NeedsFallbackSignalID(rawData.TransactionRef) {
 			id, err := genSignalID()
 			if err != nil {
 				// No PII in this log line - err is a wrapped crypto/rand
@@ -544,6 +548,22 @@ func processTransaction(sp *spool.Spool, syncForward func(ctx context.Context, s
 		}
 
 		anonymized := processor.AnonymizeSignal(*rawData, cfg.Hub.InstitutionID, salt, pepper, cfg.MosaicKeying, cfg.Local.ReportingThreshold, fallbackSignalID)
+
+		// Contract-violation guard, mirroring processor.MissingSignalIDSentinel's
+		// doc comment: this should be unreachable given the code right
+		// above (fallbackSignalID is always populated via genSignalID
+		// whenever NeedsFallbackSignalID is true, and this handler returns
+		// 500 itself if that generation fails). It is checked anyway
+		// because AnonymizeSignal has other/future callers this handler
+		// can't see, and a silent "" signal_id landing in the vendor
+		// payload AND the append-only audit record is a much worse outcome
+		// than one loud log line for a case that should never fire.
+		if anonymized.SignalID == processor.MissingSignalIDSentinel {
+			slog.Warn("signal_id fell back to sentinel - fallbackSignalID was unexpectedly blank",
+				"institution_id", anonymized.InstitutionID,
+			)
+			adapters.RecordMetric("signal_id_missing_fallback", 1)
+		}
 
 		if sp != nil {
 			payload, err := json.Marshal(anonymized)

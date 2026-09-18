@@ -800,6 +800,55 @@ func TestNewSignalID_EntropyFailureReturnsErrorNotPanic(t *testing.T) {
 	}
 }
 
+func TestNeedsFallbackSignalID(t *testing.T) {
+	tests := []struct {
+		name string
+		ref  string
+		want bool
+	}{
+		{"empty", "", true},
+		{"whitespace only (spaces)", "   ", true},
+		{"whitespace only (tab/newline)", "\t\n", true},
+		{"present", "core-banking-ref-1", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := NeedsFallbackSignalID(tt.ref); got != tt.want {
+				t.Errorf("NeedsFallbackSignalID(%q) = %v, want %v", tt.ref, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestAnonymizeSignal_MissingFallbackSignalIDProducesSentinel is the
+// regression test for the AnonymizeSignal-side defense described on
+// MissingSignalIDSentinel: if a caller violates fallbackSignalID's
+// precondition (ref absent, fallback left blank/whitespace-only), the
+// function must emit the loud, greppable sentinel rather than an empty
+// string, and must NOT panic - the panic in this exact code path is what
+// issue #4 removed.
+func TestAnonymizeSignal_MissingFallbackSignalIDProducesSentinel(t *testing.T) {
+	raw := RawData{ID: "1", Name: "Test", Account: "ACC", Amount: 100, Timestamp: "2026-01-01T00:00:00Z"}
+
+	for _, blank := range []string{"", "   ", "\t"} {
+		t.Run("blank="+blank, func(t *testing.T) {
+			sig := AnonymizeSignal(raw, "BNK", "salt", "pepper", KeyingBank, 10000, blank)
+			if sig.SignalID != MissingSignalIDSentinel {
+				t.Errorf("expected signal_id %q for a blank fallback, got %q", MissingSignalIDSentinel, sig.SignalID)
+			}
+		})
+	}
+
+	// Sanity: a non-blank fallback is unaffected.
+	sig := AnonymizeSignal(raw, "BNK", "salt", "pepper", KeyingBank, 10000, "real-fallback-id")
+	if sig.SignalID != "real-fallback-id" {
+		t.Errorf("expected the real fallback to be used verbatim, got %q", sig.SignalID)
+	}
+	if sig.SignalID == MissingSignalIDSentinel {
+		t.Error("a valid fallback must never be reported as the sentinel")
+	}
+}
+
 func TestAnonymizeSignal_FeatureVersionEmitted(t *testing.T) {
 	raw := RawData{ID: "1", Name: "Test", Account: "ACC", Amount: 100, Timestamp: "2026-01-01T00:00:00Z"}
 	sig := AnonymizeSignal(raw, "BNK", "salt", "pepper", KeyingBank, 10000, "fallback-id")

@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -568,6 +569,105 @@ func TestProcessTransaction_TransactionRefSuppliedSkipsSignalIDGeneration(t *tes
 	}
 	if captured.SignalID == "" {
 		t.Fatal("expected a derived signal_id")
+	}
+}
+
+// TestProcessTransaction_WhitespaceOnlyTransactionRefTreatedAsAbsent is the
+// end-to-end regression test for processor.NeedsFallbackSignalID: before
+// that shared predicate existed, "is transaction_ref absent" was checked
+// independently in processTransaction (deciding whether to call
+// genSignalID) and in AnonymizeSignal (deciding which signal_id branch to
+// take). They happened to agree, but nothing forced it, and no test drove a
+// whitespace-only transaction_ref through processTransaction end to end to
+// prove it - exactly the gap where a drift between the two copies would
+// have gone undetected (see NeedsFallbackSignalID's doc comment).
+//
+// The decisive check is sending the SAME whitespace-only ref twice and
+// requiring two DIFFERENT signal_id values: a ref-derived signal_id is
+// deterministic (same ref + same salt -> same hash every time, as the
+// determinism tests in internal/processor/anonymizer_test.go establish),
+// so two different results is only possible if genSignalID actually fired
+// both times and its output actually reached the response - i.e. the
+// whole pipeline agreed the ref was absent, not just one half of it. A
+// weaker assertion (just "non-empty", or comparing against one specific
+// wrong-derivation formula) would pass under several drifted-predicate
+// mutations that still happen to produce a non-empty, non-sentinel value;
+// this one does not.
+func TestProcessTransaction_WhitespaceOnlyTransactionRefTreatedAsAbsent(t *testing.T) {
+	t.Setenv("CONFIG_PATH", "/nonexistent/gateway.json")
+	t.Setenv("GATEWAY_MODE", "standalone")
+	t.Setenv("MOSAIC_KEYING", "")
+	t.Setenv("INSTITUTION_ID", "BANK_A")
+	t.Setenv("BANK_SALT", "a_sufficiently_long_bank_salt_value")
+	t.Setenv("REGIONAL_PEPPER", "")
+	t.Setenv("MOSAIC_PEPPER", "")
+	t.Cleanup(func() { config.Reload() })
+	config.Reload()
+
+	const whitespaceRef = "   "
+	body := `{
+		"id": "CUST-001",
+		"name": "John Doe",
+		"national_id": "22345678901",
+		"account": "ACC-1234567890",
+		"amount": 950.00,
+		"timestamp": "2026-01-15T14:07:33Z",
+		"transaction_ref": "` + whitespaceRef + `"
+	}`
+
+	post := func() (int, processor.AnonymizedSignal, map[string]interface{}) {
+		var captured processor.AnonymizedSignal
+		syncForward := func(_ context.Context, signal processor.AnonymizedSignal) error {
+			captured = signal
+			return nil
+		}
+		handler := processTransaction(nil, syncForward, "")
+
+		req := httptest.NewRequest(http.MethodPost, "/process", strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		handler(w, req)
+
+		var resp map[string]interface{}
+		if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("decode response body: %v", err)
+		}
+		return w.Code, captured, resp
+	}
+
+	code1, sig1, resp1 := post()
+	code2, sig2, resp2 := post()
+
+	if code1 != http.StatusOK {
+		t.Fatalf("first request: expected 200, got %d", code1)
+	}
+	if code2 != http.StatusOK {
+		t.Fatalf("second request: expected 200, got %d", code2)
+	}
+
+	for _, sig := range []processor.AnonymizedSignal{sig1, sig2} {
+		if sig.SignalID == "" {
+			t.Fatal("expected a non-empty, generated signal_id for a whitespace-only transaction_ref")
+		}
+		if sig.SignalID == processor.MissingSignalIDSentinel {
+			t.Fatalf("signal_id fell back to the missing-fallback sentinel %q - genSignalID was not invoked for a whitespace-only ref", sig.SignalID)
+		}
+		if sig.SignalID == whitespaceRef {
+			t.Error("signal_id must never equal the raw (whitespace) transaction_ref")
+		}
+	}
+
+	// The decisive assertion: identical requests, but each must get its own
+	// freshly generated fallback id.
+	if sig1.SignalID == sig2.SignalID {
+		t.Fatalf("two requests with the same whitespace-only transaction_ref got the SAME signal_id (%q) - this means signal_id is being deterministically derived from the ref instead of coming from a freshly generated fallback, i.e. transaction_ref is NOT being treated as absent end to end", sig1.SignalID)
+	}
+
+	if id, _ := resp1["signal_id"].(string); id != sig1.SignalID {
+		t.Errorf("expected the first HTTP response signal_id to match the generated fallback %q, got %q", sig1.SignalID, id)
+	}
+	if id, _ := resp2["signal_id"].(string); id != sig2.SignalID {
+		t.Errorf("expected the second HTTP response signal_id to match the generated fallback %q, got %q", sig2.SignalID, id)
 	}
 }
 

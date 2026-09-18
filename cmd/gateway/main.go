@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
@@ -38,29 +39,14 @@ func main() {
 		port = "8080"
 	}
 
-	// Validate required config
-	if cfg.Hub.InstitutionID == "" {
-		slog.Error("Required hub.institution_id is not set (set INSTITUTION_ID or provide config file)")
-		os.Exit(1)
-	}
-	if cfg.Hub.APIKey == "" {
-		slog.Error("Required hub.api_key is not set (set API_KEY or provide config file)")
-		os.Exit(1)
-	}
-	if cfg.Hub.HubEndpointURL == "" {
-		slog.Error("Required hub.hub_endpoint_url is not set (set HUB_API_URL or provide config file)")
-		os.Exit(1)
-	}
-	if os.Getenv("HMAC_SECRET") == "" {
-		slog.Error("Required HMAC_SECRET is not set - every Hub forward would fail")
-		os.Exit(1)
-	}
-	if cfg.Local.BankSalt == "" {
-		slog.Error("Required local.bank_salt is not set (set BANK_SALT or provide config file)")
-		os.Exit(1)
-	}
-	if os.Getenv("REGIONAL_PEPPER") == "" {
-		slog.Error("Required REGIONAL_PEPPER is not set - it keys the global identity mosaics; use the Hub-provided value")
+	// Validate required config. Requiredness depends on GATEWAY_MODE: a
+	// middleware gateway must fail fast if it has no destination or
+	// credentials to reach it; a standalone gateway needs neither, since it
+	// runs independent of any external system (see validateStartup).
+	if problems := validateStartup(cfg); len(problems) > 0 {
+		for _, p := range problems {
+			slog.Error(p)
+		}
 		os.Exit(1)
 	}
 
@@ -69,9 +55,56 @@ func main() {
 		slog.Warn("INBOUND_API_KEY not set - /process accepts unauthenticated requests; set it in production")
 	}
 
+	// Pepper for global-scope mosaic derivation - see resolvePepper. Never
+	// the empty string, even in standalone mode.
+	pepper, pepperIsDerived := resolvePepper(cfg)
+	if pepperIsDerived {
+		slog.Info("Standalone mode: REGIONAL_PEPPER not set, deriving a local pepper from BANK_SALT - mosaics are bank-local only and not comparable to any mosaic derived with a real REGIONAL_PEPPER")
+	}
+
+	// Delivery destination: middleware forwards one-way to the external
+	// vendor platform; standalone has no external system, so signals are
+	// written to a local durable sink instead. Either way, "forward now"
+	// (sync) or "forward later" (spool) always lands somewhere on disk or
+	// with the vendor - there is no silent no-op / discard path.
+	var sink *localSink
+	deliver := spool.ForwardFunc(adapters.ForwardPayload)
+	syncForward := func(ctx context.Context, signal processor.AnonymizedSignal) error {
+		return adapters.ForwardToHubWithRetry(ctx, signal, 2)
+	}
+	if cfg.IsStandalone() {
+		sinkDir := os.Getenv("STANDALONE_SINK_DIR")
+		if sinkDir == "" {
+			sinkDir = "./sink"
+		}
+		var err error
+		sink, err = newLocalSink(sinkDir)
+		if err != nil {
+			slog.Error("Failed to open standalone sink", "dir", sinkDir, "error", err)
+			os.Exit(1)
+		}
+		deliver = sink.Forward
+		// No bounded-retry wrapper here, unlike middleware's
+		// ForwardToHubWithRetry: middleware retries because a network call to
+		// a remote vendor can fail transiently; a local disk write either
+		// succeeds or fails for a reason (permissions, full disk) that a few
+		// immediate retries won't fix. A failure here still returns 502 to
+		// the caller, and SPOOL_DIR remains the right way to ride out a
+		// sink outage rather than retrying synchronously in the request path.
+		syncForward = func(ctx context.Context, signal processor.AnonymizedSignal) error {
+			payload, err := json.Marshal(signal)
+			if err != nil {
+				return fmt.Errorf("failed to encode signal: %w", err)
+			}
+			return sink.Forward(ctx, payload)
+		}
+		slog.Info("Standalone mode: signals are written locally, not forwarded anywhere", "sink_dir", sinkDir)
+	}
+
 	// Durable spool (recommended): /process persists anonymized signals and
-	// returns 202; a background forwarder delivers them, so Hub outages
-	// neither lose signals nor block the core banking system.
+	// returns 202; a background forwarder delivers them, so an outage of the
+	// destination (vendor platform, or a full/unwritable sink disk) neither
+	// loses signals nor blocks the core banking system.
 	var sp *spool.Spool
 	if spoolDir := os.Getenv("SPOOL_DIR"); spoolDir != "" {
 		maxDepth := 10000
@@ -81,7 +114,7 @@ func main() {
 			}
 		}
 		var err error
-		sp, err = spool.New(spoolDir, maxDepth, adapters.ForwardPayload, adapters.IsPermanent, spool.Hooks{
+		sp, err = spool.New(spoolDir, maxDepth, deliver, adapters.IsPermanent, spool.Hooks{
 			OnDelivered: func() { adapters.RecordMetric("signals_forwarded", 1) },
 			OnDead:      func() { adapters.RecordMetric("signals_dead_lettered", 1) },
 			OnDepth:     func(d int) { adapters.SetGauge("spool_depth", int64(d)) },
@@ -91,12 +124,15 @@ func main() {
 			os.Exit(1)
 		}
 		slog.Info("Durable spool enabled", "dir", spoolDir, "max_depth", maxDepth, "pending", sp.Depth())
+	} else if cfg.IsStandalone() {
+		slog.Warn("SPOOL_DIR not set - writing to the local sink synchronously; a slow/unwritable disk blocks /process")
 	} else {
-		slog.Warn("SPOOL_DIR not set - forwarding synchronously; signals are lost if the Hub is down")
+		slog.Warn("SPOOL_DIR not set - forwarding synchronously; signals are lost if the destination is down")
 	}
 
 	slog.Info("Starting Edge Gateway",
 		"port", port,
+		"mode", cfg.Mode,
 		"institution_id", cfg.Hub.InstitutionID,
 		"hub_url", cfg.Hub.HubEndpointURL,
 	)
@@ -105,7 +141,7 @@ func main() {
 
 	mux.HandleFunc("/health", adapters.HealthCheckHandler)
 	mux.HandleFunc("/metrics", adapters.MetricsHandler)
-	mux.Handle("/process", middleware.RequireAPIKey(processTransaction(sp), inboundKey))
+	mux.Handle("/process", middleware.RequireAPIKey(processTransaction(sp, syncForward, pepper), inboundKey))
 
 	// Wrap with request logging and body size limit middleware
 	handler := middleware.RequestLogger(middleware.MaxBodySize(mux, 1<<20)) // 1MB limit
@@ -168,7 +204,91 @@ func main() {
 	if sp != nil && sp.Depth() > 0 {
 		slog.Info("Undelivered signals remain spooled for next start", "pending", sp.Depth())
 	}
+	if sink != nil {
+		if err := sink.Close(); err != nil {
+			slog.Warn("Failed to close standalone sink cleanly", "error", err)
+		}
+	}
 	slog.Info("Server stopped")
+}
+
+// validateStartup returns a human-readable problem for every required
+// setting that is missing, given the selected GATEWAY_MODE. institution_id
+// and bank_salt are always required - they drive local pseudonymization
+// regardless of where (or whether) signals go. Everything needed only to
+// reach an external vendor platform (API key, destination URL, HMAC secret)
+// is required in middleware mode and not required at all in standalone mode.
+//
+// REGIONAL_PEPPER keys the global-scope mosaic derivation that exists to let
+// a peer bank derive the same pseudonym; that only matters in middleware mode
+// (see CLAUDE.md), so it stays required there for backward compatibility and
+// is not required in standalone mode.
+func validateStartup(cfg *config.GatewayConfig) []string {
+	var problems []string
+
+	if cfg.Hub.InstitutionID == "" {
+		problems = append(problems, "Required hub.institution_id is not set (set INSTITUTION_ID or provide config file)")
+	}
+	if cfg.Local.BankSalt == "" {
+		problems = append(problems, "Required local.bank_salt is not set (set BANK_SALT or provide config file)")
+	}
+
+	switch cfg.Mode {
+	case config.ModeStandalone:
+		// No external platform: hub.api_key, HUB_API_URL, HMAC_SECRET and
+		// REGIONAL_PEPPER are not needed - signals go to the local sink.
+	case config.ModeMiddleware:
+		if cfg.Hub.APIKey == "" {
+			problems = append(problems, "Required hub.api_key is not set (set API_KEY or provide config file) - required in middleware mode")
+		}
+		if cfg.Hub.HubEndpointURL == "" {
+			problems = append(problems, "Required hub.hub_endpoint_url is not set (set HUB_API_URL or provide config file) - middleware mode has no destination to forward signals to")
+		}
+		if os.Getenv("HMAC_SECRET") == "" {
+			problems = append(problems, "Required HMAC_SECRET is not set - every forward to the vendor platform would fail (required in middleware mode)")
+		}
+		if os.Getenv("REGIONAL_PEPPER") == "" {
+			problems = append(problems, "Required REGIONAL_PEPPER is not set - it keys the global identity mosaics (required in middleware mode); set GATEWAY_MODE=standalone if there is no external platform")
+		}
+	default:
+		problems = append(problems, fmt.Sprintf("Unknown GATEWAY_MODE %q - must be %q or %q", cfg.Mode, config.ModeMiddleware, config.ModeStandalone))
+	}
+
+	return problems
+}
+
+// standalonePepperDomain is a fixed domain-separation string for the
+// deployment-local pepper standalone mode derives from BANK_SALT. It has no
+// secrecy value itself - BANK_SALT is what must stay secret - it just keeps
+// this derivation distinguishable from any other use of BANK_SALT.
+const standalonePepperDomain = "standalone-pepper-v1"
+
+// resolvePepper returns the key used for global-scope mosaic derivation, and
+// whether it was derived (rather than taken from REGIONAL_PEPPER directly).
+//
+// In middleware mode this is always the shared REGIONAL_PEPPER
+// (validateStartup already guarantees it's non-empty there). In standalone
+// mode REGIONAL_PEPPER isn't required and is typically unset - but the
+// derivation must never run with an empty key: HMAC-SHA256("", msg) is a
+// publicly computable function with no secret in it, and a national ID
+// (BVN/NIN) is only an 11-digit space, so every global-scope mosaic written
+// to the sink would be trivially reversible offline by anyone who can read
+// those files. Standalone mode's whole premise is that data stays inside the
+// bank, so that would be a silent, serious weakening of the pseudonymization
+// the gateway advertises. So when REGIONAL_PEPPER is unset in standalone
+// mode, derive a deployment-local pepper from BANK_SALT instead - never hand
+// the derivation an empty key. BANK_SALT's secrecy is then what protects the
+// local sink data; see README's Configuration section. If an operator sets
+// REGIONAL_PEPPER explicitly even in standalone mode, that value is used
+// as-is.
+func resolvePepper(cfg *config.GatewayConfig) (pepper string, derived bool) {
+	if p := os.Getenv("REGIONAL_PEPPER"); p != "" {
+		return p, false
+	}
+	if cfg.IsStandalone() {
+		return processor.HMACHash(cfg.Local.BankSalt, standalonePepperDomain), true
+	}
+	return "", false
 }
 
 // healthcheck probes the local /health endpoint and returns a process exit code.
@@ -198,8 +318,12 @@ func healthcheck() int {
 
 // processTransaction validates, anonymizes, and hands off one transaction.
 // With a spool: persist and return 202 Accepted (delivery is asynchronous).
-// Without: forward synchronously with bounded retry and return 200/502.
-func processTransaction(sp *spool.Spool) http.HandlerFunc {
+// Without: deliver synchronously via syncForward and return 200/502.
+// syncForward is mode-dependent: middleware forwards to the vendor platform
+// with bounded retry, standalone writes to the local sink. pepper is the key
+// for global-scope mosaic derivation, resolved once at startup (see main) -
+// never the empty string, even in standalone mode.
+func processTransaction(sp *spool.Spool, syncForward func(ctx context.Context, signal processor.AnonymizedSignal) error, pepper string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		startTime := time.Now()
 
@@ -218,7 +342,6 @@ func processTransaction(sp *spool.Spool) http.HandlerFunc {
 
 		cfg := config.Get()
 		salt := cfg.Local.BankSalt
-		pepper := os.Getenv("REGIONAL_PEPPER")
 
 		anonymized := processor.AnonymizeSignal(*rawData, cfg.Hub.InstitutionID, salt, pepper, cfg.Local.ReportingThreshold)
 
@@ -258,15 +381,16 @@ func processTransaction(sp *spool.Spool) http.HandlerFunc {
 			return
 		}
 
-		// Synchronous mode: forward to Hub with bounded retry
-		if err := adapters.ForwardToHubWithRetry(r.Context(), anonymized, 2); err != nil {
-			slog.Error("Failed to forward to hub",
+		// Synchronous mode: deliver now (Hub forward with bounded retry in
+		// middleware mode, or a local sink write in standalone mode).
+		if err := syncForward(r.Context(), anonymized); err != nil {
+			slog.Error("Failed to deliver signal",
 				"error", err,
 				"institution_id", anonymized.InstitutionID,
 				"mosaic_prefix", anonymized.IdentityMosaic[:16],
 			)
 			adapters.RecordMetric("forward_failures", 1)
-			http.Error(w, "Failed to forward signal to hub: "+err.Error(), http.StatusBadGateway)
+			http.Error(w, "Failed to deliver signal: "+err.Error(), http.StatusBadGateway)
 			return
 		}
 

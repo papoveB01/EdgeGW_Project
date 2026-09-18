@@ -48,6 +48,21 @@ func TestForwardToHub_SignsPayload(t *testing.T) {
 	}
 }
 
+func TestForwardPayload_NoDestinationIsPermanentError(t *testing.T) {
+	// No hardcoded fallback destination: if nothing configured a Hub/vendor
+	// URL, ForwardPayload must fail loudly and permanently rather than
+	// silently posting to a placeholder host.
+	setupHubEnv(t, "")
+
+	err := ForwardPayload(context.Background(), []byte(`{}`))
+	if err == nil {
+		t.Fatal("expected an error when no destination is configured")
+	}
+	if !IsPermanent(err) {
+		t.Errorf("expected a permanent (non-retryable) error, got: %v", err)
+	}
+}
+
 func TestForwardToHubWithRetry_RetriesServerErrors(t *testing.T) {
 	var attempts int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

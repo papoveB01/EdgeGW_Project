@@ -97,17 +97,54 @@ Optional fields: `national_id` (BVN/NIN — enables cross-bank matching), `latit
 
 ## Configuration
 
+### Deployment modes
+
+The gateway runs in one of two modes, set with `GATEWAY_MODE`:
+
+- **`middleware`** (default, for backward compatibility) — one-way egress to an
+  external vendor fraud platform (inference only; the vendor never trains on
+  this data, and never sends anything back over this channel). Requires
+  `HUB_API_URL`, `API_KEY`, `HMAC_SECRET`, and `REGIONAL_PEPPER`. If any of
+  these is missing, the gateway **fails fast at startup** with a clear error —
+  it no longer silently starts up and POSTs to a placeholder host.
+- **`standalone`** — the gateway runs independent of any external system.
+  None of the vendor-facing settings above are required. Anonymized signals
+  are instead written to local durable storage (newline-delimited JSON, one
+  file per UTC day) under `STANDALONE_SINK_DIR`, so signals are never
+  silently dropped or queued forever with nowhere to go. It has no built-in
+  rotation or retention policy — old files accumulate until an operator
+  archives or deletes them.
+
+Both modes still require `INSTITUTION_ID` and `BANK_SALT`: they drive local
+pseudonymization regardless of where (or whether) signals leave the bank.
+
+**Standalone mode and `REGIONAL_PEPPER`:** global-scope mosaics (produced
+whenever a `national_id` is supplied) are a keyed HMAC — `HMACHash(pepper,
+"v2|id|"+national_id)`. An HMAC keyed with an *empty* string is a publicly
+computable function with no secret in it, and a national ID (BVN/NIN) is only
+an 11-digit space — trivially enumerable offline. Standalone mode never runs
+that derivation with an empty key: if `REGIONAL_PEPPER` is unset (the normal
+case, since it isn't required), the gateway derives a deployment-local pepper
+from `BANK_SALT` instead and logs that it did so once at startup. The
+practical consequence is that **`BANK_SALT` secrecy is what protects the
+mosaics written to the local sink** in standalone mode — treat it accordingly.
+These bank-local mosaics are also not comparable across banks or to anything
+derived with a real `REGIONAL_PEPPER`, which is expected: standalone mode has
+no peer bank to match against in the first place.
+
 ### Environment Variables
 
 | Variable | Required | Description |
 |----------|----------|-------------|
-| `INSTITUTION_ID` | Yes | Your institution ID from Hub onboarding |
-| `API_KEY` | Yes | API key from Hub onboarding |
-| `HMAC_SECRET` | Yes | HMAC signing secret from Hub onboarding |
-| `HUB_API_URL` | Yes | Hub signal endpoint URL |
+| `GATEWAY_MODE` | No | `middleware` (default) or `standalone` — see [Deployment modes](#deployment-modes) |
+| `INSTITUTION_ID` | Yes | Your institution's own identifier; used in local pseudonymization in both modes |
+| `API_KEY` | Yes, in `middleware` mode | API key for the vendor platform |
+| `HMAC_SECRET` | Yes, in `middleware` mode | HMAC signing secret for the vendor platform |
+| `HUB_API_URL` | Yes, in `middleware` mode | Vendor platform signal endpoint URL. There is no built-in default — an unset value fails startup instead of silently posting to a placeholder host |
 | `BANK_SALT` | Yes | Local salt for hashing (min 32 chars, never shared) |
-| `REGIONAL_PEPPER` | Yes | Shared pepper from Hub — the HMAC key for global mosaics (enables cross-bank matching) |
-| `SPOOL_DIR` | Recommended | Durable queue directory; enables async 202 mode so Hub outages don't lose signals (Docker default: `/spool`) |
+| `REGIONAL_PEPPER` | Yes, in `middleware` mode | HMAC key for global-scope mosaics. Not required in `standalone` mode — if unset there, a local pepper is derived from `BANK_SALT` instead (never an empty key; see [Deployment modes](#deployment-modes)) |
+| `STANDALONE_SINK_DIR` | No | Directory for the local sink's newline-delimited JSON files in `standalone` mode (default: `./sink`; Docker default: `/sink`) |
+| `SPOOL_DIR` | Recommended | Durable queue directory; enables async 202 mode so a destination outage doesn't lose signals (Docker default: `/spool`) |
 | `SPOOL_MAX_DEPTH` | No | Max queued signals before /process returns 503 (default: 10000) |
 | `GATEWAY_PORT` | No | Server port (default: 8080) |
 | `REPORTING_THRESHOLD` | No | AML reporting limit (default: 10000) |

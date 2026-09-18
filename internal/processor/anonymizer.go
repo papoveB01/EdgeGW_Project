@@ -16,7 +16,17 @@ import (
 // MosaicVersion identifies the mosaic derivation scheme so downstream
 // consumers can distinguish signals produced by different gateway
 // generations.
-const MosaicVersion = 2
+//
+// v3 is a flag-day, non-backward-compatible cutover from v2: the domain
+// prefixes hashed into the mosaic changed from "v2|..." to "v3|...", so a
+// v3 mosaic can never collide with a v2 one by construction — there is no
+// dual emission and no migration path other than partitioning on this
+// field. See MosaicKeying and the mosaic_scope/mosaic_basis fields on
+// AnonymizedSignal for what else changed. This is deliberately decoupled
+// from FeatureVersion (the model-facing feature shape) and from the
+// "v2|sigid|" domain prefix used for SignalID — those are independent
+// version concerns that did not change here.
+const MosaicVersion = 3
 
 // FeatureVersion identifies the shape of the derived, model-facing features
 // below — amount tier boundaries, the timestamp bucket width, and geohash
@@ -46,13 +56,72 @@ const (
 	GeohashPrecision = 5
 )
 
-// Mosaic scopes: global mosaics are keyed only with the shared regional pepper
-// over a canonical identifier (BVN/NIN), so the same person produces the same
-// mosaic at every member bank. Local mosaics include the bank salt and
-// bank-internal identifiers — they are stable within one institution only.
+// MosaicKeying selects how AnonymizeSignal keys identity/destination
+// mosaics. It is a deployment-wide policy choice (config.MosaicKeying),
+// not a per-signal one.
+//
+//   - KeyingBank (default): every mosaic folds BANK_SALT into the HMAC key,
+//     so a mosaic is never reproducible by anyone lacking this institution's
+//     own secret. REGIONAL_PEPPER/MOSAIC_PEPPER is optional in this mode; if
+//     set, it is folded in too as additional key material (defense in
+//     depth — leaking either secret alone must not reproduce a mosaic), but
+//     its absence is not a weakness because BANK_SALT is always present.
+//   - KeyingRegional (opt-in): mosaics derived from a canonical national ID
+//     are keyed on the shared pepper ALONE, exactly like the pre-v3 scheme —
+//     every gateway sharing that pepper derives the same mosaic for the same
+//     person, with no bank-specific secret required. This exists to support
+//     a future remote/regional querying use case and is a deliberate
+//     re-introduction of cross-gateway derivability: anyone holding the
+//     pepper can enumerate the identifier space and build a full mosaic
+//     table. Only enable it when that tradeoff is an explicit, understood
+//     product decision. Name+internal-ID fallback mosaics (no national ID
+//     available) always fold in BANK_SALT regardless of this setting — see
+//     BasisInternalIDFallback.
+//
+// Any value other than KeyingRegional is treated as KeyingBank (the safer
+// default) — see AnonymizeSignal.
 const (
-	ScopeGlobal = "global"
-	ScopeLocal  = "local"
+	KeyingBank     = "bank"
+	KeyingRegional = "regional"
+)
+
+// Mosaic scope identifies WHICH KEYING produced a mosaic — the fact that
+// determines whether cross-gateway matching is even valid for it. This is
+// the v3 replacement for the old "global"/"local" Hub-matching flag (the Hub
+// this was designed for no longer exists): a bank-scoped mosaic can only
+// ever be compared within the institution that produced it; a
+// regional-scoped mosaic can be compared across any gateway sharing the same
+// pepper.
+//
+// This is independent of MosaicBasis (what kind of identifier produced the
+// mosaic) — see that constant block for the orthogonal fact it carries.
+const (
+	// ScopeBank means the mosaic was keyed with this institution's own
+	// BANK_SALT (see KeyingBank) — it is not comparable to a mosaic from any
+	// other institution, full stop, regardless of what produced the
+	// underlying identifier.
+	ScopeBank = "bank"
+	// ScopeRegional means the mosaic was keyed on the shared pepper alone
+	// (see KeyingRegional) — it is comparable across every gateway
+	// configured with the same pepper.
+	ScopeRegional = "regional"
+)
+
+// Mosaic basis identifies WHAT IDENTIFIER produced a mosaic — independent of
+// MosaicScope above (which only reflects how it was keyed).
+const (
+	// BasisNationalID means the mosaic was derived from a canonical national
+	// identifier (BVN/NIN). This is the stable case: the same identifier
+	// always produces the same mosaic for as long as the keying material
+	// doesn't change.
+	BasisNationalID = "national_id"
+	// BasisInternalIDFallback means no canonical national identifier was
+	// available, so the mosaic falls back to a bank-internal identifier
+	// (and, for identity mosaics, the person's name). This is weaker: it
+	// changes if the internal ID changes or a name is corrected, and it is
+	// always bank-scoped (ScopeBank) regardless of MosaicKeying, since it is
+	// inherently tied to this institution's own internal records.
+	BasisInternalIDFallback = "internal_id_fallback"
 )
 
 // ValidSignalTypes is the closed allowlist enforced by RawData.Validate for
@@ -231,31 +300,65 @@ type AnonymizedSignal struct {
 	InstitutionID  string `json:"institution_id"`
 	SignalType     string `json:"signal_type"`
 	IdentityMosaic string `json:"identity_mosaic"`
-	MosaicScope    string `json:"mosaic_scope"`
-	MosaicVersion  int    `json:"mosaic_version"`
+	// MosaicScope is which keying produced IdentityMosaic — ScopeBank or
+	// ScopeRegional — and determines whether it is valid to compare this
+	// mosaic against one from a different gateway. See the ScopeBank/
+	// ScopeRegional doc comments.
+	MosaicScope string `json:"mosaic_scope"`
+	// MosaicBasis is what kind of identifier produced IdentityMosaic —
+	// BasisNationalID or BasisInternalIDFallback — orthogonal to
+	// MosaicScope. See those constants' doc comments.
+	MosaicBasis   string `json:"mosaic_basis"`
+	MosaicVersion int    `json:"mosaic_version"`
 	// FeatureVersion identifies the shape of the derived features in
 	// Metadata (amount tier, timestamp bucket, geohash precision) — see the
 	// FeatureVersion constant doc for what bumps it.
-	FeatureVersion         int                    `json:"feature_version"`
-	Timestamp              string                 `json:"timestamp"`
-	Metadata               map[string]interface{} `json:"metadata"`
-	DestinationMosaic      string                 `json:"destination_mosaic,omitempty"`
-	DestinationMosaicScope string                 `json:"destination_mosaic_scope,omitempty"`
+	FeatureVersion    int                    `json:"feature_version"`
+	Timestamp         string                 `json:"timestamp"`
+	Metadata          map[string]interface{} `json:"metadata"`
+	DestinationMosaic string                 `json:"destination_mosaic,omitempty"`
+	// DestinationMosaicScope / DestinationMosaicBasis mirror MosaicScope /
+	// MosaicBasis above, but for DestinationMosaic. Present iff
+	// DestinationMosaic is.
+	DestinationMosaicScope string `json:"destination_mosaic_scope,omitempty"`
+	DestinationMosaicBasis string `json:"destination_mosaic_basis,omitempty"`
 }
 
-// Hash creates a SHA-256 hash of the input string.
+// Hash creates a SHA-256 hash of the input string. Retained as a general
+// utility; AnonymizeSignal no longer uses it — mosaics and the account/
+// device/ip hashes it emits all use the keyed HMACHash below instead (see
+// HMACHash's doc comment for why plain concatenation-hashing is the weaker
+// construction).
 func Hash(input string) string {
 	hash := sha256.Sum256([]byte(input))
 	return hex.EncodeToString(hash[:])
 }
 
-// HMACHash computes hex-encoded HMAC-SHA256(key, message). Mosaics use a keyed
-// MAC rather than plain concatenation-hashing so an attacker without the key
-// cannot mount an offline dictionary attack on low-entropy identifiers.
+// HMACHash computes hex-encoded HMAC-SHA256(key, message). Mosaics and the
+// account/device/ip hashes use a keyed MAC rather than plain
+// concatenation-hashing (Hash(value+"|"+salt)) so an attacker without the
+// key cannot mount an offline dictionary attack on low-entropy identifiers.
 func HMACHash(key, message string) string {
 	mac := hmac.New(sha256.New, []byte(key))
 	mac.Write([]byte(message))
 	return hex.EncodeToString(mac.Sum(nil))
+}
+
+// mosaicKeyMaterial builds the HMAC key used for bank-scoped (KeyingBank)
+// mosaic derivation: always keyed with this institution's own BANK_SALT,
+// with the pepper folded in as additional key material only when it is set.
+// pepper is optional in bank mode (see KeyingBank), so this must not produce
+// an empty-key HMAC either way — salt is required upstream (validateStartup)
+// and is always present here.
+//
+// Folding the pepper in when present, rather than ignoring it, is deliberate
+// defense in depth: leaking BANK_SALT alone, or the pepper alone, must not
+// be enough on its own to reproduce a mosaic that was keyed with both.
+func mosaicKeyMaterial(salt, pepper string) string {
+	if pepper == "" {
+		return salt
+	}
+	return salt + "|" + pepper
 }
 
 // NormalizeID strips whitespace, dots and dashes and uppercases, so
@@ -395,20 +498,39 @@ func NewSignalID() string {
 
 // AnonymizeSignal processes raw PII data into an anonymized signal.
 // Uses delimited field concatenation to prevent boundary collisions.
-func AnonymizeSignal(rawPii RawData, institutionID string, salt string, pepper string, reportingThreshold float64) AnonymizedSignal {
-	// 1. Identity Mosaic (v2).
-	// With a canonical national ID (BVN/NIN): HMAC keyed by the shared pepper
-	// only, so every member bank derives the same mosaic for the same person.
-	// Without one: HMAC keyed by salt+pepper over normalized local identity —
-	// stable within this institution only, tagged ScopeLocal so the Hub
-	// doesn't attempt cross-bank matching on it.
-	var mosaic, mosaicScope string
+func AnonymizeSignal(rawPii RawData, institutionID string, salt string, pepper string, keying string, reportingThreshold float64) AnonymizedSignal {
+	// 1. Identity Mosaic (v3).
+	//
+	// With a canonical national ID (BVN/NIN), keying depends on the
+	// deployment's MosaicKeying policy:
+	//   - keying == KeyingRegional: HMAC keyed by the shared pepper ALONE, so
+	//     every gateway sharing that pepper derives the same mosaic for the
+	//     same person (cross-gateway derivable by design — see KeyingRegional).
+	//   - anything else (KeyingBank, the default, and any unrecognized value —
+	//     unrecognized values fail safe to the more restrictive option): HMAC
+	//     keyed by mosaicKeyMaterial(salt, pepper), which always folds in this
+	//     institution's own BANK_SALT, so the mosaic is not reproducible by
+	//     anyone lacking that secret.
+	//
+	// Without a national ID, the mosaic falls back to normalized local
+	// identity (internal ID + name) and ALWAYS folds in BANK_SALT via
+	// mosaicKeyMaterial, regardless of MosaicKeying — this fallback has no
+	// cross-gateway meaning in the first place (it's tied to this
+	// institution's own internal records), so it is always ScopeBank.
+	var mosaic, mosaicScope, mosaicBasis string
 	if nid := NormalizeID(rawPii.NationalID); nid != "" {
-		mosaic = HMACHash(pepper, "v2|id|"+nid)
-		mosaicScope = ScopeGlobal
+		mosaicBasis = BasisNationalID
+		if keying == KeyingRegional {
+			mosaic = HMACHash(pepper, "v3|id|"+nid)
+			mosaicScope = ScopeRegional
+		} else {
+			mosaic = HMACHash(mosaicKeyMaterial(salt, pepper), "v3|id|"+nid)
+			mosaicScope = ScopeBank
+		}
 	} else {
-		mosaic = HMACHash(salt+"|"+pepper, "v2|local|"+NormalizeID(rawPii.ID)+"|"+NormalizeName(rawPii.Name))
-		mosaicScope = ScopeLocal
+		mosaic = HMACHash(mosaicKeyMaterial(salt, pepper), "v3|local|"+NormalizeID(rawPii.ID)+"|"+NormalizeName(rawPii.Name))
+		mosaicScope = ScopeBank
+		mosaicBasis = BasisInternalIDFallback
 	}
 
 	// 2. Amount tier
@@ -463,10 +585,16 @@ func AnonymizeSignal(rawPii RawData, institutionID string, salt string, pepper s
 		signalID = NewSignalID()
 	}
 
+	// account_hash/device_id_hash/ip_hash use the same keyed-HMAC construction
+	// as the mosaics above (HMACHash(salt, "v3|<field>|"+value)), not the
+	// older plain SHA-256(value+"|"+salt): a plain hash over a salt-suffixed
+	// concatenation is not a keyed MAC and is weaker against an attacker who
+	// only needs the (much lower-entropy) value to mount an offline
+	// dictionary attack — see HMACHash's doc comment.
 	meta := map[string]interface{}{
 		"amount_tier":   tier,
 		"location_zone": zone,
-		"account_hash":  Hash(rawPii.Account + "|" + salt),
+		"account_hash":  HMACHash(salt, "v3|account|"+rawPii.Account),
 	}
 	if isNearThreshold {
 		meta["is_near_threshold"] = true
@@ -476,14 +604,14 @@ func AnonymizeSignal(rawPii RawData, institutionID string, salt string, pepper s
 	if rawPii.DeviceIDHash != "" {
 		meta["device_id_hash"] = rawPii.DeviceIDHash
 	} else if rawPii.DeviceID != "" {
-		meta["device_id_hash"] = Hash(rawPii.DeviceID + "|" + salt)
+		meta["device_id_hash"] = HMACHash(salt, "v3|device|"+rawPii.DeviceID)
 	}
 
 	// IP hash
 	if rawPii.IPHash != "" {
 		meta["ip_hash"] = rawPii.IPHash
 	} else if rawPii.IP != "" {
-		meta["ip_hash"] = Hash(rawPii.IP + "|" + salt)
+		meta["ip_hash"] = HMACHash(salt, "v3|ip|"+rawPii.IP)
 	}
 
 	// Branch ID (not PII — physical location identifier)
@@ -500,22 +628,35 @@ func AnonymizeSignal(rawPii RawData, institutionID string, salt string, pepper s
 		SignalType:     signalType,
 		IdentityMosaic: mosaic,
 		MosaicScope:    mosaicScope,
+		MosaicBasis:    mosaicBasis,
 		MosaicVersion:  MosaicVersion,
 		FeatureVersion: FeatureVersion,
 		Timestamp:      bucketedTimestamp,
 		Metadata:       meta,
 	}
 
-	// Destination mosaic for Mule Route detection. The global derivation is
-	// identical to the identity mosaic's, so a counterparty's destination
-	// mosaic matches their own identity mosaic when they transact — exactly
-	// what route-following needs.
+	// Destination mosaic for Mule Route detection. The keying mirrors the
+	// identity mosaic's above (same MosaicKeying policy, same fold-in-salt
+	// default), and the national-ID branch's derivation is byte-identical to
+	// the identity mosaic's own national-ID derivation, so a counterparty's
+	// destination mosaic matches their own identity mosaic when they
+	// transact — exactly what route-following needs. That equality only
+	// holds when both sides were produced under the same MosaicKeying
+	// policy; route-following across gateways therefore requires
+	// KeyingRegional on both ends, same as identity-mosaic matching does.
 	if cn := NormalizeID(rawPii.CounterpartyNationalID); cn != "" {
-		out.DestinationMosaic = HMACHash(pepper, "v2|id|"+cn)
-		out.DestinationMosaicScope = ScopeGlobal
+		out.DestinationMosaicBasis = BasisNationalID
+		if keying == KeyingRegional {
+			out.DestinationMosaic = HMACHash(pepper, "v3|id|"+cn)
+			out.DestinationMosaicScope = ScopeRegional
+		} else {
+			out.DestinationMosaic = HMACHash(mosaicKeyMaterial(salt, pepper), "v3|id|"+cn)
+			out.DestinationMosaicScope = ScopeBank
+		}
 	} else if rawPii.CounterpartyID != "" {
-		out.DestinationMosaic = HMACHash(salt+"|"+pepper, "v2|local|"+NormalizeID(rawPii.CounterpartyID))
-		out.DestinationMosaicScope = ScopeLocal
+		out.DestinationMosaic = HMACHash(mosaicKeyMaterial(salt, pepper), "v3|local|"+NormalizeID(rawPii.CounterpartyID))
+		out.DestinationMosaicScope = ScopeBank
+		out.DestinationMosaicBasis = BasisInternalIDFallback
 	}
 
 	return out

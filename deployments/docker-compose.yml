@@ -31,6 +31,13 @@ services:
       #   its way.
       - GATEWAY_MODE=${GATEWAY_MODE:-middleware}
 
+      # ─── Mosaic keying (independent of GATEWAY_MODE) ────────────────
+      # bank (default): every mosaic folds in BANK_SALT; MOSAIC_PEPPER
+      #   below is optional. regional: national-ID mosaics are keyed on
+      #   MOSAIC_PEPPER alone - REQUIRED in that mode. See .env.example
+      #   and README's Configuration section for the full tradeoff.
+      - MOSAIC_KEYING=${MOSAIC_KEYING:-bank}
+
       # ─── Vendor platform params (required in middleware mode only) ─
       # All three use ${VAR?...} (no colon - see comment above): fails
       # `docker compose up` with a clear one-line error if forgotten
@@ -40,12 +47,20 @@ services:
       - HUB_API_URL=${HUB_API_URL?Set HUB_API_URL (required in middleware mode, no placeholder default is used; set to an explicit empty value for standalone, e.g. HUB_API_URL= in .env)}
 
       # ─── Local params (managed by the bank, never sent externally) ─
-      # INSTITUTION_ID/BANK_SALT are required in BOTH modes (unlike the
-      # vendor params above), so they keep ${VAR:?...} - an empty value is
-      # never acceptable for them, in middleware or standalone.
+      # INSTITUTION_ID/BANK_SALT are required in BOTH modes, so they keep
+      # ${VAR:?...} - an empty value is never acceptable for them.
+      # MOSAIC_PEPPER is optional when MOSAIC_KEYING=bank (the default) and
+      # required when MOSAIC_KEYING=regional (main.validateStartup fails
+      # fast at startup if it's unset in that mode) - unlike
+      # INSTITUTION_ID/BANK_SALT, an empty value here is fine in the
+      # default mode, so this keeps the no-colon ${VAR?...} form. Set
+      # MOSAIC_PEPPER= (present, but blank) in .env to run with bank
+      # keying and no pepper. REGIONAL_PEPPER is accepted as a
+      # backward-compatible alias for this variable by the application
+      # (not by this compose file).
       - INSTITUTION_ID=${INSTITUTION_ID:?Set INSTITUTION_ID}
       - BANK_SALT=${BANK_SALT:?Set BANK_SALT (min 32 chars)}
-      - REGIONAL_PEPPER=${REGIONAL_PEPPER?Set REGIONAL_PEPPER (required in middleware mode; set to an explicit empty value for standalone, e.g. REGIONAL_PEPPER= in .env)}
+      - MOSAIC_PEPPER=${MOSAIC_PEPPER?Set MOSAIC_PEPPER (required when MOSAIC_KEYING=regional; optional, may be left blank, when MOSAIC_KEYING=bank - the default)}
 
       # ─── Standalone mode only (ignored in middleware mode) ─────────
       - STANDALONE_SINK_DIR=${STANDALONE_SINK_DIR:-/sink}

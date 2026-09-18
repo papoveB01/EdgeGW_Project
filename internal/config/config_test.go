@@ -126,3 +126,53 @@ func TestLoad_ModeFromFile(t *testing.T) {
 		t.Errorf("expected mode from file %q, got %q", ModeStandalone, cfg.Mode)
 	}
 }
+
+func TestLoad_MosaicKeyingDefaultsToBank(t *testing.T) {
+	t.Setenv("CONFIG_PATH", "/nonexistent/gateway.json")
+	t.Setenv("MOSAIC_KEYING", "")
+	t.Cleanup(func() { Reload() })
+
+	cfg := Reload()
+
+	if cfg.MosaicKeying != MosaicKeyingBank {
+		t.Errorf("expected default mosaic keying %q, got %q", MosaicKeyingBank, cfg.MosaicKeying)
+	}
+}
+
+func TestLoad_MosaicKeyingFromEnv_NormalizedCaseAndWhitespace(t *testing.T) {
+	t.Setenv("CONFIG_PATH", "/nonexistent/gateway.json")
+	t.Setenv("MOSAIC_KEYING", "  Regional  ")
+	t.Cleanup(func() { Reload() })
+
+	cfg := Reload()
+
+	if cfg.MosaicKeying != MosaicKeyingRegional {
+		t.Errorf("expected normalized mosaic keying %q, got %q", MosaicKeyingRegional, cfg.MosaicKeying)
+	}
+}
+
+func TestLoad_MosaicKeyingEnvOverridesFile(t *testing.T) {
+	path := writeConfigFile(t, `{"mosaic_keying": "regional"}`)
+	t.Setenv("CONFIG_PATH", path)
+	t.Setenv("MOSAIC_KEYING", "bank")
+	t.Cleanup(func() { Reload() })
+
+	cfg := Reload()
+
+	if cfg.MosaicKeying != MosaicKeyingBank {
+		t.Errorf("env must override file mosaic keying: got %q", cfg.MosaicKeying)
+	}
+}
+
+func TestLoad_MosaicKeyingFromFile(t *testing.T) {
+	path := writeConfigFile(t, `{"mosaic_keying": "regional"}`)
+	t.Setenv("CONFIG_PATH", path)
+	t.Setenv("MOSAIC_KEYING", "")
+	t.Cleanup(func() { Reload() })
+
+	cfg := Reload()
+
+	if cfg.MosaicKeying != MosaicKeyingRegional {
+		t.Errorf("expected mosaic keying from file %q, got %q", MosaicKeyingRegional, cfg.MosaicKeying)
+	}
+}

@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/papoveB01/EdgeGW_Project/internal/adapters"
+	"github.com/papoveB01/EdgeGW_Project/internal/auditlog"
 	"github.com/papoveB01/EdgeGW_Project/internal/config"
 	"github.com/papoveB01/EdgeGW_Project/internal/middleware"
 	"github.com/papoveB01/EdgeGW_Project/internal/processor"
@@ -75,11 +76,28 @@ func main() {
 	// written to a local durable sink instead. Either way, "forward now"
 	// (sync) or "forward later" (spool) always lands somewhere on disk or
 	// with the vendor - there is no silent no-op / discard path.
+	//
+	// deliver is the spool's background forwarder: single-attempt, because
+	// the spool itself already retries (with its own backoff) across
+	// restarts. syncDeliverBytes is its synchronous-mode (no SPOOL_DIR)
+	// counterpart, and does get a bounded retry wrapper in middleware mode
+	// - a network call to a remote vendor can fail transiently; see the
+	// standalone branch below for why that wrapper isn't used there. Both
+	// operate on already-marshaled bytes rather than the signal struct
+	// directly, so that whatever wraps them for the audit trail below
+	// hashes exactly the bytes transmitted, never a second, separately
+	// re-marshaled copy of them (see auditingForward / auditingSyncForward
+	// doc comments).
 	var sink *localSink
 	deliver := spool.ForwardFunc(adapters.ForwardPayload)
-	syncForward := func(ctx context.Context, signal processor.AnonymizedSignal) error {
-		return adapters.ForwardToHubWithRetry(ctx, signal, 2)
-	}
+	syncDeliverBytes := spool.ForwardFunc(func(ctx context.Context, payload []byte) error {
+		return adapters.ForwardPayloadWithRetry(ctx, payload, 2)
+	})
+	// destination identifies, for the audit trail below, where signals
+	// actually go: the vendor URL in middleware mode, or the standalone
+	// sink's directory. Resolved once here (same place deliver/
+	// syncDeliverBytes are resolved) rather than re-read per record.
+	destination := cfg.Hub.HubEndpointURL
 	if cfg.IsStandalone() {
 		sinkDir := os.Getenv("STANDALONE_SINK_DIR")
 		if sinkDir == "" {
@@ -91,22 +109,82 @@ func main() {
 			slog.Error("Failed to open standalone sink", "dir", sinkDir, "error", err)
 			os.Exit(1)
 		}
+		destination = "local-sink:" + sinkDir
 		deliver = sink.Forward
 		// No bounded-retry wrapper here, unlike middleware's
-		// ForwardToHubWithRetry: middleware retries because a network call to
-		// a remote vendor can fail transiently; a local disk write either
+		// ForwardPayloadWithRetry: middleware retries because a network call
+		// to a remote vendor can fail transiently; a local disk write either
 		// succeeds or fails for a reason (permissions, full disk) that a few
 		// immediate retries won't fix. A failure here still returns 502 to
 		// the caller, and SPOOL_DIR remains the right way to ride out a
 		// sink outage rather than retrying synchronously in the request path.
-		syncForward = func(ctx context.Context, signal processor.AnonymizedSignal) error {
-			payload, err := json.Marshal(signal)
-			if err != nil {
-				return fmt.Errorf("failed to encode signal: %w", err)
-			}
-			return sink.Forward(ctx, payload)
-		}
+		syncDeliverBytes = sink.Forward
 		slog.Info("Standalone mode: signals are written locally, not forwarded anywhere", "sink_dir", sinkDir)
+	}
+
+	// Durable egress audit log: a record written ONLY after a destination
+	// confirms delivery, surviving both process restarts and spool deletion
+	// (internal/spool removes a signal's file the instant delivery
+	// succeeds, so it is never evidence of what left the bank - see
+	// internal/auditlog's package doc). Without this, nothing durable
+	// answers "show me everything you sent this vendor last quarter".
+	//
+	// Default is disabled with a loud startup warning, mirroring SPOOL_DIR:
+	// audit records are compliance infrastructure that changes what a
+	// regulator can be shown, not a default-on convenience, and an operator
+	// who hasn't provisioned a directory (and its retention policy - this
+	// package never rotates or expires records, same as the standalone
+	// sink) for permanent personal-data records shouldn't get one silently
+	// created under their working directory.
+	var auditLogger *auditlog.Logger
+	// redeliverGuard backs auditingForward's retry-storm bound (see that
+	// function's doc comment). It must be cleared whenever the spool
+	// dead-letters an item WITHOUT going through auditingForward's closure
+	// (forwardOldest's unreadable-spool-file branch does exactly that) - see
+	// redeliveryGuard's doc comment for why a stale guard would otherwise
+	// risk a FALSE "delivered" audit record. Declared here (nil until the
+	// audit block below possibly sets it) so the spool's OnDead hook, wired
+	// further down, can reach it regardless of whether audit logging is
+	// enabled.
+	var redeliverGuard *redeliveryGuard
+	if auditDir := os.Getenv("EGRESS_AUDIT_DIR"); auditDir != "" {
+		storePayload := os.Getenv("EGRESS_AUDIT_STORE_PAYLOAD") == "true"
+		var err error
+		// auditlog.New itself probes that auditDir is actually writable
+		// (not just that it exists), so a misconfigured mount fails here,
+		// at startup, rather than at the first confirmed delivery.
+		auditLogger, err = auditlog.New(auditDir, storePayload)
+		if err != nil {
+			slog.Error("Failed to open egress audit log", "dir", auditDir, "error", err)
+			os.Exit(1)
+		}
+		// health is shared by both wrappers below so ONE readiness signal
+		// (see internal/adapters.SetReadinessAuditStatus) reflects either
+		// delivery path's audit write getting stuck - synchronous mode has
+		// no other automatic degradation signal the way the spool has
+		// staleness.
+		health := newAuditHealth()
+		redeliverGuard = newRedeliveryGuard()
+		deliver = auditingForward(deliver, auditLogger, destination, health, redeliverGuard)
+		syncDeliverBytes = auditingSyncForward(syncDeliverBytes, auditLogger, destination, health)
+		adapters.SetReadinessAuditStatus(func() adapters.AuditStatus { return health.status() })
+		slog.Info("Egress audit log enabled", "dir", auditDir, "store_full_payload", storePayload, "destination", destination)
+	} else {
+		slog.Warn("EGRESS_AUDIT_DIR not set - confirmed deliveries are not durably recorded; an auditor cannot be shown what left the bank")
+	}
+
+	// syncForward is the signal-typed entry point processTransaction calls
+	// in synchronous (no SPOOL_DIR) mode. It marshals exactly once and
+	// hands the resulting bytes to syncDeliverBytes - by this point
+	// possibly wrapped with audit logging above - so the same bytes are
+	// both transmitted and (if audit logging is enabled) hashed for the
+	// audit record.
+	syncForward := func(ctx context.Context, signal processor.AnonymizedSignal) error {
+		payload, err := json.Marshal(signal)
+		if err != nil {
+			return fmt.Errorf("failed to encode signal: %w", err)
+		}
+		return syncDeliverBytes(ctx, payload)
 	}
 
 	// Readiness thresholds: egress is one-way (no score ever comes back
@@ -132,6 +210,11 @@ func main() {
 		}
 	}
 	adapters.SetReadinessThresholds(readinessMaxDepthRatio, readinessMaxStaleness)
+	if v := os.Getenv("READINESS_MAX_AUDIT_FAILURES"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			adapters.SetReadinessMaxAuditFailures(n)
+		}
+	}
 
 	// Durable spool (recommended): /process persists anonymized signals and
 	// returns 202; a background forwarder delivers them, so an outage of the
@@ -148,9 +231,22 @@ func main() {
 		var err error
 		sp, err = spool.New(spoolDir, maxDepth, deliver, adapters.IsPermanent, spool.Hooks{
 			OnDelivered: func(queueTime time.Duration) { adapters.RecordDelivery(queueTime) },
-			OnDead:      func() { adapters.RecordMetric("signals_dead_lettered", 1) },
-			OnFailed:    func() { adapters.RecordMetric("delivery_attempt_failures", 1) },
-			OnDepth:     func(d int) { adapters.SetGauge("spool_depth", int64(d)) },
+			OnDead: func() {
+				adapters.RecordMetric("signals_dead_lettered", 1)
+				// Any dead-letter event means an item just left the queue
+				// - including via forwardOldest's unreadable-spool-file
+				// branch, which bypasses auditingForward's closure
+				// entirely. redeliverGuard must forget whatever it was
+				// holding so a later, byte-identical payload can't be
+				// mistaken for "already delivered" - see
+				// redeliveryGuard's doc comment. nil (no
+				// EGRESS_AUDIT_DIR configured) is a safe no-op.
+				if redeliverGuard != nil {
+					redeliverGuard.clear()
+				}
+			},
+			OnFailed: func() { adapters.RecordMetric("delivery_attempt_failures", 1) },
+			OnDepth:  func(d int) { adapters.SetGauge("spool_depth", int64(d)) },
 			OnOldestPendingAge: func(ageSeconds float64) {
 				adapters.SetGauge("spool_oldest_pending_age_seconds", int64(ageSeconds))
 			},
@@ -257,6 +353,11 @@ func main() {
 	if sink != nil {
 		if err := sink.Close(); err != nil {
 			slog.Warn("Failed to close standalone sink cleanly", "error", err)
+		}
+	}
+	if auditLogger != nil {
+		if err := auditLogger.Close(); err != nil {
+			slog.Warn("Failed to close egress audit log cleanly", "error", err)
 		}
 	}
 	slog.Info("Server stopped")

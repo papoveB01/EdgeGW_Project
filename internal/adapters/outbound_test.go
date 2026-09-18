@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 
@@ -116,6 +117,88 @@ func TestForwardToHubWithRetry_ContextCancelStopsRetries(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	err := ForwardToHubWithRetry(ctx, map[string]string{"k": "v"}, 2)
+	if err == nil {
+		t.Fatal("expected error with cancelled context")
+	}
+	if n := atomic.LoadInt32(&attempts); n > 1 {
+		t.Errorf("cancelled context should stop retries: got %d attempts", n)
+	}
+}
+
+// TestForwardPayloadWithRetry_SendsIdenticalBytesOnEveryAttempt is
+// ForwardPayloadWithRetry's key property over ForwardToHubWithRetry: since
+// it never re-marshals, every attempt (including retries) must transmit
+// byte-for-byte the same payload it was given, not merely a
+// deterministic-so-far re-encoding of some other value.
+func TestForwardPayloadWithRetry_SendsIdenticalBytesOnEveryAttempt(t *testing.T) {
+	var attempts int32
+	var mu sync.Mutex
+	var gotBodies [][]byte
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body := make([]byte, r.ContentLength)
+		r.Body.Read(body)
+		mu.Lock()
+		gotBodies = append(gotBodies, body)
+		mu.Unlock()
+		if atomic.AddInt32(&attempts, 1) < 3 {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+	setupHubEnv(t, srv.URL)
+
+	payload := []byte(`{"signal_id":"sig-retry-bytes","mosaic_version":2}`)
+	if err := ForwardPayloadWithRetry(context.Background(), payload, 2); err != nil {
+		t.Fatalf("expected success after retries, got: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(gotBodies) != 3 {
+		t.Fatalf("expected 3 attempts, got %d", len(gotBodies))
+	}
+	for i, body := range gotBodies {
+		if string(body) != string(payload) {
+			t.Errorf("attempt %d sent %q, want %q (bytes must be identical across every retry)", i, body, payload)
+		}
+	}
+}
+
+func TestForwardPayloadWithRetry_NoRetryOnClientError(t *testing.T) {
+	var attempts int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&attempts, 1)
+		http.Error(w, "bad api key", http.StatusUnauthorized)
+	}))
+	defer srv.Close()
+	setupHubEnv(t, srv.URL)
+
+	err := ForwardPayloadWithRetry(context.Background(), []byte(`{}`), 2)
+	if err == nil {
+		t.Fatal("expected error for 401 response")
+	}
+	if !IsPermanent(err) {
+		t.Errorf("expected a permanent (non-retryable) error, got: %v", err)
+	}
+	if n := atomic.LoadInt32(&attempts); n != 1 {
+		t.Errorf("4xx must not be retried: expected 1 attempt, got %d", n)
+	}
+}
+
+func TestForwardPayloadWithRetry_ContextCancelStopsRetries(t *testing.T) {
+	var attempts int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&attempts, 1)
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+	setupHubEnv(t, srv.URL)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	err := ForwardPayloadWithRetry(ctx, []byte(`{}`), 2)
 	if err == nil {
 		t.Fatal("expected error with cancelled context")
 	}

@@ -86,10 +86,19 @@ services:
       # section.
       - READINESS_MAX_DEPTH_RATIO=${READINESS_MAX_DEPTH_RATIO:-0.95}
       - READINESS_MAX_STALENESS_SECONDS=${READINESS_MAX_STALENESS_SECONDS:-900}
+      - READINESS_MAX_AUDIT_FAILURES=${READINESS_MAX_AUDIT_FAILURES:-3}
+      # Durable egress audit log: a record of every CONFIRMED delivery,
+      # separate from the spool (which deletes on success). Empty by
+      # default (audit trail disabled, logged loudly at startup) - set
+      # EGRESS_AUDIT_DIR to enable it; see README's "Egress audit log"
+      # section for the compliance rationale and failure semantics.
+      - EGRESS_AUDIT_DIR=${EGRESS_AUDIT_DIR:-}
+      - EGRESS_AUDIT_STORE_PAYLOAD=${EGRESS_AUDIT_STORE_PAYLOAD:-false}
     volumes:
       - ./config:/config:ro
       - spool-data:/spool
       - sink-data:/sink
+      - audit-data:/audit
     healthcheck:
       # Distroless image has no shell/wget — the binary probes itself.
       test: ["CMD", "/edge-gateway", "-healthcheck"]
@@ -101,3 +110,4 @@ services:
 volumes:
   spool-data:
   sink-data:
+  audit-data:

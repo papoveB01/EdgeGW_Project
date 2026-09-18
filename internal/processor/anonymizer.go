@@ -295,7 +295,11 @@ type AnonymizedSignal struct {
 	// never ships it to the vendor. The bank recomputes the same HMAC over
 	// its own references to join results back; the vendor, without
 	// BANK_SALT, cannot invert it. When TransactionRef is absent, SignalID
-	// is a random UUIDv4 instead.
+	// is AnonymizeSignal's fallbackSignalID parameter verbatim — by
+	// convention a random UUIDv4 the caller generated with NewSignalID()
+	// (see that parameter's doc comment on AnonymizeSignal) — or, if that
+	// parameter was left blank in violation of its precondition,
+	// MissingSignalIDSentinel.
 	SignalID       string `json:"signal_id"`
 	InstitutionID  string `json:"institution_id"`
 	SignalType     string `json:"signal_type"`
@@ -465,40 +469,114 @@ func BucketTimestamp(ts string) string {
 // crypto/rand. It carries no information about the underlying transaction
 // or person — it is pure randomness, never derived from PII.
 //
-// On rand.Read failure this panics rather than returning an error. That is
-// a deliberate, scoped tradeoff, not an oversight:
-//   - rand.Read only fails when the OS's CSPRNG itself is broken (see the
-//     crypto/rand docs) — a condition under which continuing to serve any
-//     request is already unsound, not just this one field.
-//   - Threading a real error out of here would change AnonymizeSignal's
-//     signature (today a pure `(RawData, ...) AnonymizedSignal` function,
-//     by design per this repo's architecture notes) and every caller,
-//     including cmd/gateway/main.go's processTransaction — which is
-//     explicitly out of scope for this change beyond echoing signal_id in
-//     the response body.
+// It returns an error instead of panicking when rand.Read fails, so the
+// caller can turn a broken OS entropy source into an observable failure
+// (structured log + metric + a proper HTTP status) instead of a bare
+// connection reset. See cmd/gateway/main.go's processTransaction, which
+// calls this BEFORE AnonymizeSignal (only when RawData.TransactionRef is
+// absent) and handles a returned error with the same slog.Error + metric +
+// http.Error(500) pattern used by every other failure branch there.
 //
-// Known gap this leaves: net/http recovers panics per-connection with no
-// structured log or metric, so unlike every other failure path in
-// processTransaction (slog.Error + a proper http.Error status), a
-// rand.Read failure currently surfaces to the caller as a bare connection
-// reset. If this entropy-failure mode matters for this deployment's threat
-// model, the fix is to make AnonymizeSignal return an error and update
-// processTransaction (and its tests) to log and respond 500 — tracked as
-// follow-up work rather than folded into this change; see
-// https://github.com/papoveB01/EdgeGW_Project/issues/4.
-func NewSignalID() string {
+// AnonymizeSignal itself does not call this — see its doc comment for why:
+// generating the fallback ID here, in the caller, keeps AnonymizeSignal a
+// genuinely pure function of its inputs. Originally NewSignalID panicked on
+// failure and was called from inside AnonymizeSignal; that gap is what
+// https://github.com/papoveB01/EdgeGW_Project/issues/4 tracked and this
+// change closes.
+func NewSignalID() (string, error) {
+	return newSignalIDFrom(rand.Read)
+}
+
+// newSignalIDFrom is NewSignalID's implementation, parameterized on the
+// entropy source so tests can inject a failing one (e.g. a func literal
+// that always returns an error) to exercise the failure path
+// deterministically, without patching crypto/rand globally or resorting to
+// unsafe tricks. read must have crypto/rand.Read's signature.
+func newSignalIDFrom(read func([]byte) (int, error)) (string, error) {
 	var b [16]byte
-	if _, err := rand.Read(b[:]); err != nil {
-		panic("processor: failed to read random bytes for signal_id: " + err.Error())
+	if _, err := read(b[:]); err != nil {
+		return "", fmt.Errorf("processor: failed to read random bytes for signal_id: %w", err)
 	}
 	b[6] = (b[6] & 0x0f) | 0x40 // version 4
 	b[8] = (b[8] & 0x3f) | 0x80 // variant 10xx
-	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
+	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16]), nil
 }
 
-// AnonymizeSignal processes raw PII data into an anonymized signal.
-// Uses delimited field concatenation to prevent boundary collisions.
-func AnonymizeSignal(rawPii RawData, institutionID string, salt string, pepper string, keying string, reportingThreshold float64) AnonymizedSignal {
+// NeedsFallbackSignalID reports whether ref (RawData.TransactionRef) is
+// absent — blank or whitespace-only counts as absent — and AnonymizeSignal
+// will therefore use its fallbackSignalID parameter instead of a
+// ref-derived signal_id.
+//
+// This is the single, exported definition of "absent" for this decision.
+// Both processTransaction (deciding whether it needs to call
+// genSignalID/NewSignalID before invoking AnonymizeSignal at all) and
+// AnonymizeSignal itself (deciding which branch to take) call this rather
+// than each independently re-implementing strings.TrimSpace(ref) == "".
+// Before this existed, the two copies of that check happened to agree but
+// nothing forced them to: no test drives a whitespace-only transaction_ref
+// through processTransaction end to end, so if one copy silently drifted
+// (e.g. someone dropped the TrimSpace on one side), fallbackSignalID would
+// never be generated, AnonymizeSignal would still think a ref was absent,
+// and signal_id would go out as "" in both the vendor payload and the
+// append-only audit record. One definition makes that drift impossible
+// rather than merely unlikely today.
+func NeedsFallbackSignalID(ref string) bool {
+	return strings.TrimSpace(ref) == ""
+}
+
+// MissingSignalIDSentinel is emitted as signal_id when NeedsFallbackSignalID
+// reports the reference absent AND the caller-supplied fallbackSignalID is
+// itself blank — a contract violation of AnonymizeSignal's fallbackSignalID
+// precondition (see that parameter's doc comment). This should be
+// unreachable via processTransaction, which always populates
+// fallbackSignalID via genSignalID/NewSignalID before calling
+// AnonymizeSignal whenever NeedsFallbackSignalID is true, and returns a 500
+// itself if that generation fails rather than calling AnonymizeSignal with
+// nothing. It exists as a last line of defense for any OTHER caller, a
+// future second entry point, or a mis-written test that skips that step.
+//
+// Deliberately NOT a panic: this exact code path used to panic (see
+// NewSignalID's history / https://github.com/papoveB01/EdgeGW_Project/issues/4),
+// which is precisely the failure mode this package is now trying to avoid
+// in the request path. An empty string here would be silently wrong — an
+// unusable, un-joinable signal_id that looks superficially valid in a JSON
+// payload or an audit record. This sentinel is deliberately loud instead:
+// greppable in the audit log and in any vendor-side join, so a caller bug
+// producing a blank fallback is an obvious, detectable evidentiary gap
+// rather than a silent one.
+const MissingSignalIDSentinel = "MISSING_SIGNAL_ID"
+
+// AnonymizeSignal processes raw PII data into an anonymized signal. It is a
+// pure function: for identical inputs (including fallbackSignalID) it
+// always produces an identical output, does no I/O, and never touches OS
+// entropy itself. Uses delimited field concatenation to prevent boundary
+// collisions.
+//
+// fallbackSignalID is used verbatim as the output SignalID only when
+// NeedsFallbackSignalID(rawPii.TransactionRef) is true (TransactionRef
+// absent; blank/whitespace-only counts as absent) — when TransactionRef is
+// supplied, fallbackSignalID is ignored entirely and SignalID is
+// deterministically derived from the reference instead (see the SignalID
+// field doc on AnonymizedSignal). PRECONDITION: whenever
+// NeedsFallbackSignalID(rawPii.TransactionRef) is true, the caller must
+// supply a non-blank fallbackSignalID (normally via processor.NewSignalID(),
+// called BEFORE AnonymizeSignal so a crypto/rand failure can become a
+// proper HTTP error instead of reaching this function at all) — violating
+// that precondition does not panic or error, it produces
+// MissingSignalIDSentinel instead (see that constant's doc comment). A
+// caller with a TransactionRef in hand may pass "" for fallbackSignalID,
+// since it won't be used.
+//
+// This parameter (and the caller-side generation it implies) used to live
+// inside this function: NewSignalID was called directly from here, which
+// made AnonymizeSignal neither pure nor deterministic whenever
+// TransactionRef was absent, and made a broken OS entropy source panic
+// deep inside a "pure" function with no chance for the caller to turn it
+// into a proper HTTP error. Moving random-ID generation out to the caller
+// (see processTransaction in cmd/gateway/main.go) restores genuine purity
+// here and fixes that panic; see
+// https://github.com/papoveB01/EdgeGW_Project/issues/4.
+func AnonymizeSignal(rawPii RawData, institutionID string, salt string, pepper string, keying string, reportingThreshold float64, fallbackSignalID string) AnonymizedSignal {
 	// 1. Identity Mosaic (v3).
 	//
 	// With a canonical national ID (BVN/NIN), keying depends on the
@@ -568,7 +646,9 @@ func AnonymizeSignal(rawPii RawData, institutionID string, salt string, pepper s
 	// keeps the identifier the bank can recompute (same ref -> same
 	// signal_id, so it still works as an idempotency key), while ensuring
 	// nothing recoverable ever reaches the vendor, who never holds
-	// BANK_SALT. When absent, generate a random one instead — still never
+	// BANK_SALT. When absent, use the caller-supplied fallbackSignalID
+	// instead (see this function's doc comment for why the random
+	// generation itself happens in the caller, not here) — still never
 	// derived from PII.
 	//
 	// Deliberately NOT NormalizeID here: NormalizeID uppercases and strips
@@ -579,10 +659,14 @@ func AnonymizeSignal(rawPii RawData, institutionID string, salt string, pepper s
 	// must not collide onto the same signal_id. Hash the trimmed raw bytes
 	// instead — TransactionRef is case-sensitive and punctuation-sensitive.
 	var signalID string
-	if ref := strings.TrimSpace(rawPii.TransactionRef); ref != "" {
-		signalID = HMACHash(salt, "v2|sigid|"+ref)
+	if !NeedsFallbackSignalID(rawPii.TransactionRef) {
+		signalID = HMACHash(salt, "v2|sigid|"+strings.TrimSpace(rawPii.TransactionRef))
+	} else if strings.TrimSpace(fallbackSignalID) == "" {
+		// Contract violation guard — see MissingSignalIDSentinel's doc
+		// comment. Should be unreachable via processTransaction.
+		signalID = MissingSignalIDSentinel
 	} else {
-		signalID = NewSignalID()
+		signalID = fallbackSignalID
 	}
 
 	// account_hash/device_id_hash/ip_hash use the same keyed-HMAC construction

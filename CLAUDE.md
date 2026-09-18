@@ -159,6 +159,36 @@ Both modes must stay in sync when changing response shape or metrics.
 straight pass-through of `config.GatewayConfig.MosaicKeying` — do not
 hardcode a keying mode inside `AnonymizeSignal` or `processTransaction`.
 
+`AnonymizeSignal` takes a `fallbackSignalID string` parameter rather than
+generating a random `signal_id` itself — it never touches OS entropy, so it
+stays genuinely pure (same inputs, including `fallbackSignalID`, always
+produce the same output) even on the no-`transaction_ref` path. The caller
+(`processTransaction` in `cmd/gateway/main.go`) generates that ID with
+`processor.NewSignalID()` *before* calling `AnonymizeSignal`, only when
+`RawData.TransactionRef` is absent, and handles a `crypto/rand` failure
+there the same way every other failure branch in `processTransaction` does:
+`slog.Error` (no PII), `adapters.RecordMetric("signal_id_generation_failures", 1)`,
+and `http.Error(..., http.StatusInternalServerError)` — see
+`genSignalID` in `main.go` (a swappable package var wrapping
+`processor.NewSignalID`, so tests can inject a failing entropy source).
+`NewSignalID` itself returns `(string, error)` rather than panicking; it
+used to panic on `crypto/rand.Read` failure, which `net/http` recovered
+per-connection with no log line, no metric, and no HTTP status — see
+https://github.com/papoveB01/EdgeGW_Project/issues/4.
+
+"Is `transaction_ref` absent" (blank/whitespace-only counts as absent) has
+exactly one definition: `processor.NeedsFallbackSignalID`. Both
+`processTransaction` (deciding whether to call `genSignalID` at all) and
+`AnonymizeSignal` (deciding which `signal_id` branch to take) call it —
+don't reintroduce a second, independent `strings.TrimSpace(ref) == ""`
+check in either place, or the two can silently drift apart. If
+`AnonymizeSignal` is ever called with `NeedsFallbackSignalID` true and a
+blank `fallbackSignalID` anyway (a contract violation `processTransaction`
+itself can't produce, but a future caller might), it emits
+`processor.MissingSignalIDSentinel` (`"MISSING_SIGNAL_ID"`) rather than an
+empty string or a panic — loud and greppable in the vendor payload and the
+audit log, instead of a silent unusable join key.
+
 - **Bank-scoped mosaic (default, `KeyingBank`)** =
   `HMAC-SHA256(mosaicKeyMaterial(BANK_SALT, pepper), "v3|id|"+NormalizeID(national_id))`,
   where `mosaicKeyMaterial` folds the pepper in only when it's set (empty

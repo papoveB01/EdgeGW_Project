@@ -2,7 +2,6 @@ package adapters
 
 import (
 	"encoding/json"
-	"math"
 	"net/http"
 	"sync"
 	"sync/atomic"
@@ -24,12 +23,28 @@ var (
 	// of exposing a value that goes stale the instant it's set.
 	lastDeliveryUnixNano atomic.Int64
 
-	// deliveryLatencyEWMABitsMs holds math.Float64bits of an exponentially
-	// weighted moving average of delivery latency, in milliseconds. Unlike
-	// the lifetime sum/count average below, this tracks *recent* deliveries
-	// so a fresh incident (e.g. the vendor slowing down) moves it quickly
+	// deliveryLatencyEWMA holds an exponentially weighted moving average of
+	// delivery latency, in milliseconds, guarded by ewmaMu. Unlike the
+	// lifetime sum/count average below, this tracks *recent* deliveries so
+	// a fresh incident (e.g. the vendor slowing down) moves it quickly
 	// instead of being diluted by hours of prior fast deliveries.
-	deliveryLatencyEWMABitsMs atomic.Uint64
+	//
+	// This is deliberately a plain mutex, not a lock-free CAS-over-bits
+	// scheme: a sub-millisecond delivery is a legitimate sample of exactly
+	// 0.0, which is indistinguishable from "no data yet" if "uninitialized"
+	// is encoded as the float's zero bit pattern (a prior version of this
+	// code did exactly that, and the collision made delivery_latency_ms_ewma
+	// silently vanish from /metrics on the very first fast delivery — the
+	// worst possible failure mode for a metric that exists to catch silent
+	// failure). An explicit bool cannot collide with any float value. It's
+	// also the simpler design for what is actually single-writer in this
+	// binary (spool.Run's one forwarder goroutine calls OnDelivered ->
+	// RecordDelivery), so lock-free bought nothing here; the mutex has
+	// negligible cost and stays correct if a future caller adds a second
+	// writer.
+	ewmaMu          sync.Mutex
+	ewmaInitialized bool
+	ewmaValueMs     float64
 )
 
 // deliveryLatencyEWMAAlpha is the weight given to each new latency sample.
@@ -37,22 +52,26 @@ var (
 // roughly the last ~5 deliveries dominate the average.
 const deliveryLatencyEWMAAlpha = 0.2
 
-// updateDeliveryLatencyEWMA folds one new latency sample (in milliseconds)
-// into the running exponentially weighted moving average. It's lock-free
-// (CAS retry loop) so concurrent deliveries never lose an update, and never
-// blocks the delivery path on a mutex.
+// updateDeliveryLatencyEWMA folds one new latency sample (in milliseconds,
+// may legitimately be 0 or fractional) into the running exponentially
+// weighted moving average.
 func updateDeliveryLatencyEWMA(sampleMs float64) {
-	for {
-		oldBits := deliveryLatencyEWMABitsMs.Load()
-		next := sampleMs
-		if oldBits != 0 {
-			old := math.Float64frombits(oldBits)
-			next = deliveryLatencyEWMAAlpha*sampleMs + (1-deliveryLatencyEWMAAlpha)*old
-		}
-		if deliveryLatencyEWMABitsMs.CompareAndSwap(oldBits, math.Float64bits(next)) {
-			return
-		}
+	ewmaMu.Lock()
+	defer ewmaMu.Unlock()
+	if !ewmaInitialized {
+		ewmaValueMs = sampleMs
+		ewmaInitialized = true
+		return
 	}
+	ewmaValueMs = deliveryLatencyEWMAAlpha*sampleMs + (1-deliveryLatencyEWMAAlpha)*ewmaValueMs
+}
+
+// deliveryLatencyEWMA returns the current EWMA and whether any sample has
+// been recorded yet.
+func deliveryLatencyEWMA() (ms float64, ok bool) {
+	ewmaMu.Lock()
+	defer ewmaMu.Unlock()
+	return ewmaValueMs, ewmaInitialized
 }
 
 // RecordMetric increments a named counter.
@@ -104,10 +123,14 @@ func RecordDelivery(queueTime time.Duration) {
 	lastDeliveryUnixNano.Store(time.Now().UnixNano())
 	RecordMetric("signals_forwarded", 1)
 	if queueTime > 0 {
-		ms := queueTime.Milliseconds()
-		RecordMetric("delivery_latency_ms_sum", ms)
+		// Microsecond precision converted to a float millisecond value:
+		// queueTime.Milliseconds() truncates toward zero, so any delivery
+		// under 1ms would otherwise record as exactly 0 and be
+		// indistinguishable from "no sample" wherever that matters.
+		msFloat := float64(queueTime.Microseconds()) / 1000.0
+		RecordMetric("delivery_latency_ms_sum", queueTime.Milliseconds())
 		RecordMetric("delivery_latency_count", 1)
-		updateDeliveryLatencyEWMA(float64(ms))
+		updateDeliveryLatencyEWMA(msFloat)
 	}
 }
 
@@ -149,8 +172,8 @@ func MetricsHandler(w http.ResponseWriter, r *http.Request) {
 		// it — see delivery_latency_ms_ewma for a metric that reacts to
 		// current conditions.
 		result["delivery_latency_ms_lifetime_avg"] = float64(latencySum) / float64(latencyCount)
-		if ewmaBits := deliveryLatencyEWMABitsMs.Load(); ewmaBits != 0 {
-			result["delivery_latency_ms_ewma"] = math.Float64frombits(ewmaBits)
+		if ewma, ok := deliveryLatencyEWMA(); ok {
+			result["delivery_latency_ms_ewma"] = ewma
 		}
 	}
 

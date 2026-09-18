@@ -16,6 +16,12 @@ var (
 		gauges   map[string]*int64
 	}{counters: make(map[string]*int64), gauges: make(map[string]*int64)}
 	startTime = time.Now()
+
+	// lastDeliveryUnixNano holds the UnixNano timestamp of the most recent
+	// successful delivery (0 = never). It's a plain atomic rather than a
+	// gauge so /metrics can compute "seconds since" at scrape time instead
+	// of exposing a value that goes stale the instant it's set.
+	lastDeliveryUnixNano atomic.Int64
 )
 
 // RecordMetric increments a named counter.
@@ -56,6 +62,20 @@ func SetGauge(name string, value int64) {
 	atomic.StoreInt64(gauge, value)
 }
 
+// RecordDelivery records a successful signal delivery for the freshness
+// metrics: time-since-last-successful-delivery and delivery latency
+// (queueTime is how long the signal waited between being accepted and being
+// confirmed delivered; pass 0 when latency isn't known, e.g. synchronous
+// forwarding with no queue).
+func RecordDelivery(queueTime time.Duration) {
+	lastDeliveryUnixNano.Store(time.Now().UnixNano())
+	RecordMetric("signals_forwarded", 1)
+	if queueTime > 0 {
+		RecordMetric("delivery_latency_ms_sum", queueTime.Milliseconds())
+		RecordMetric("delivery_latency_count", 1)
+	}
+}
+
 // MetricsHandler returns current metrics as JSON.
 func MetricsHandler(w http.ResponseWriter, r *http.Request) {
 	metricsStore.mu.RLock()
@@ -65,11 +85,31 @@ func MetricsHandler(w http.ResponseWriter, r *http.Request) {
 		"uptime_seconds": int(time.Since(startTime).Seconds()),
 		"started_at":     startTime.UTC().Format(time.RFC3339),
 	}
+	var latencySum, latencyCount int64
 	for name, counter := range metricsStore.counters {
-		result[name] = atomic.LoadInt64(counter)
+		v := atomic.LoadInt64(counter)
+		result[name] = v
+		switch name {
+		case "delivery_latency_ms_sum":
+			latencySum = v
+		case "delivery_latency_count":
+			latencyCount = v
+		}
 	}
 	for name, gauge := range metricsStore.gauges {
 		result[name] = atomic.LoadInt64(gauge)
+	}
+
+	// Computed at scrape time so these never go stale between events: a
+	// feed idle for hours still shows its true age, not the age recorded
+	// at the last event.
+	if last := lastDeliveryUnixNano.Load(); last != 0 {
+		result["seconds_since_last_delivery"] = time.Since(time.Unix(0, last)).Seconds()
+	} else {
+		result["seconds_since_last_delivery"] = nil
+	}
+	if latencyCount > 0 {
+		result["delivery_latency_ms_avg"] = float64(latencySum) / float64(latencyCount)
 	}
 
 	w.Header().Set("Content-Type", "application/json")

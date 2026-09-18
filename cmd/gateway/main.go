@@ -101,6 +101,25 @@ func main() {
 		slog.Info("Standalone mode: signals are written locally, not forwarded anywhere", "sink_dir", sinkDir)
 	}
 
+	// Health check thresholds: egress is one-way (no score ever comes back
+	// through the gateway), so this handler and /metrics are the only way
+	// to tell a healthy feed from one stuck hours behind. Read directly
+	// from the environment rather than internal/config so this stays a
+	// self-contained observability concern.
+	healthMaxDepthRatio := adapters.DefaultHealthMaxDepthRatio
+	if v := os.Getenv("HEALTH_MAX_DEPTH_RATIO"); v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil && f > 0 && f <= 1 {
+			healthMaxDepthRatio = f
+		}
+	}
+	healthMaxStaleness := adapters.DefaultHealthMaxStaleness
+	if v := os.Getenv("HEALTH_MAX_STALENESS_SECONDS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			healthMaxStaleness = time.Duration(n) * time.Second
+		}
+	}
+	adapters.SetHealthThresholds(healthMaxDepthRatio, healthMaxStaleness)
+
 	// Durable spool (recommended): /process persists anonymized signals and
 	// returns 202; a background forwarder delivers them, so an outage of the
 	// destination (vendor platform, or a full/unwritable sink disk) neither
@@ -115,14 +134,28 @@ func main() {
 		}
 		var err error
 		sp, err = spool.New(spoolDir, maxDepth, deliver, adapters.IsPermanent, spool.Hooks{
-			OnDelivered: func() { adapters.RecordMetric("signals_forwarded", 1) },
+			OnDelivered: func(queueTime time.Duration) { adapters.RecordDelivery(queueTime) },
 			OnDead:      func() { adapters.RecordMetric("signals_dead_lettered", 1) },
+			OnFailed:    func() { adapters.RecordMetric("delivery_attempt_failures", 1) },
 			OnDepth:     func(d int) { adapters.SetGauge("spool_depth", int64(d)) },
+			OnOldestPendingAge: func(ageSeconds float64) {
+				adapters.SetGauge("spool_oldest_pending_age_seconds", int64(ageSeconds))
+			},
 		})
 		if err != nil {
 			slog.Error("Failed to open spool", "dir", spoolDir, "error", err)
 			os.Exit(1)
 		}
+		adapters.SetGauge("spool_max_depth", int64(maxDepth))
+		adapters.SetHealthSpoolStatus(func() adapters.SpoolStatus {
+			age, hasPending := sp.OldestPendingAge(time.Now())
+			return adapters.SpoolStatus{
+				Depth:            sp.Depth(),
+				MaxDepth:         sp.MaxDepth(),
+				OldestPendingAge: age,
+				HasPending:       hasPending,
+			}
+		})
 		slog.Info("Durable spool enabled", "dir", spoolDir, "max_depth", maxDepth, "pending", sp.Depth())
 	} else if cfg.IsStandalone() {
 		slog.Warn("SPOOL_DIR not set - writing to the local sink synchronously; a slow/unwritable disk blocks /process")

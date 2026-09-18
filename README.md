@@ -334,7 +334,7 @@ The gateway authenticates to the Hub using a 3-point handshake:
 - **Request body size limit** — 1MB max to prevent OOM attacks
 - **Structured JSON logging** — no PII in logs
 - **Graceful shutdown** — in-flight requests drain on SIGINT/SIGTERM (15s budget)
-- **Durable spool** — anonymized signals (never raw PII) persist to disk, fsynced before acknowledgment by default (`SPOOL_FSYNC=false` opts out — see [Durable spool](#durable-spool)); delivery survives Hub outages, gateway restarts, *and* host power loss/hard resets, with dead-lettering for permanently rejected signals
+- **Durable spool** — anonymized signals (never raw PII) persist to disk, fsynced before acknowledgment by default (`SPOOL_FSYNC=false` opts out — see [Durable spool](#durable-spool)); delivery survives Hub outages and gateway restarts unconditionally, and (with fsync enabled, the default) host power loss/hard resets too, with dead-lettering for permanently rejected signals
 - **Bounded retry with exponential backoff** — 4xx Hub errors are not retried; in synchronous mode the full retry budget (~8.25s) fits inside the 10s write timeout; client cancellation stops retries
 
 ## Development

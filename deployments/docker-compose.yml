@@ -77,9 +77,20 @@ services:
       - INBOUND_API_KEY=${INBOUND_API_KEY:-}
       - TLS_CERT_FILE=${TLS_CERT_FILE:-}
       - TLS_KEY_FILE=${TLS_KEY_FILE:-}
-      # Durable queue: signals survive destination outages and gateway restarts
+      # Durable queue: /process persists signals and returns 202 before a
+      # background forwarder delivers them, so a destination outage doesn't
+      # lose signals or block the core banking system. By default (fsync
+      # on, see SPOOL_FSYNC below) this also covers a host power loss, not
+      # just a gateway process crash/restart.
       - SPOOL_DIR=${SPOOL_DIR:-/spool}
       - SPOOL_MAX_DEPTH=${SPOOL_MAX_DEPTH:-10000}
+      # By default (unset, or anything other than "false"), Enqueue fsyncs
+      # the signal's temp file and the spool directory, so the 202 above
+      # means the signal survives a HOST POWER LOSS, not just a process
+      # crash. Set to "false" only if you have measured your own storage
+      # and accepted the risk - see README's "Durable spool" section and
+      # .env.example.
+      - SPOOL_FSYNC=${SPOOL_FSYNC:-true}
       # Readiness thresholds for /readyz (spool backlog/staleness). This is
       # NOT the liveness endpoint the healthcheck below calls - /readyz must
       # never be wired to an auto-restart action; see README's API Endpoints

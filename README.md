@@ -64,8 +64,9 @@ Send `national_id` (and `counterparty_national_id` on transfers) whenever availa
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
-| `/health` | GET | Service health check |
-| `/metrics` | GET | Operational metrics (signals processed, spool depth, failures, uptime) |
+| `/health` | GET | **Liveness** only: 200 whenever this process can serve HTTP, full stop. It never inspects the spool, so a full or stale spool during a destination outage — which a restart cannot fix — still reports healthy. This is what the Docker healthcheck (and the binary's `-healthcheck` self-probe) calls, and it is the **only** one of these three endpoints safe to wire to an auto-restart action (a Kubernetes `livenessProbe`, Swarm, an autoheal sidecar, etc). |
+| `/readyz` | GET | **Readiness/degradation**, not liveness: reports whether the gateway is keeping up, not just alive. Returns `503` with a `reasons` list when a registered spool is at/near capacity (see `READINESS_MAX_DEPTH_RATIO`) or its oldest pending signal has aged past a staleness threshold (see `READINESS_MAX_STALENESS_SECONDS`). A full or stale spool during a destination outage is the durable queue working as designed, not a dead process — restarting fixes neither the backlog (it survives on the spool volume) nor the outage, and would only add a self-inflicted `/process` outage on top. **Never wire this endpoint to an auto-restart action.** Wire it to alerting/paging, or, if used as a Kubernetes `readinessProbe`, to traffic removal only. |
+| `/metrics` | GET | Operational metrics (signals processed, spool depth and age of oldest pending item, delivery failures and latency, uptime). Because egress to the destination is one-way, this and `/readyz` are the only way to tell a feed running hours behind from a healthy one. |
 | `/process` | POST | Accept raw transaction, anonymize, deliver to Hub (requires `INBOUND_API_KEY` when set). With `SPOOL_DIR` set: persists the anonymized signal and returns **202 Accepted**; a background forwarder delivers it. Without: forwards synchronously and returns 200 (or 502 on failure). |
 
 > A compliance `resolve-pii` endpoint (mosaic → local PII lookup) is planned but intentionally not shipped: it requires a local encrypted audit store and Hub-issued officer JWT validation, neither of which exists yet.
@@ -146,6 +147,8 @@ no peer bank to match against in the first place.
 | `STANDALONE_SINK_DIR` | No | Directory for the local sink's newline-delimited JSON files in `standalone` mode (default: `./sink`; Docker default: `/sink`) |
 | `SPOOL_DIR` | Recommended | Durable queue directory; enables async 202 mode so a destination outage doesn't lose signals (Docker default: `/spool`) |
 | `SPOOL_MAX_DEPTH` | No | Max queued signals before /process returns 503 (default: 10000) |
+| `READINESS_MAX_DEPTH_RATIO` | No | Fraction of `SPOOL_MAX_DEPTH` at/above which `/readyz` reports unhealthy (default: `0.95`). See [API Endpoints](#api-endpoints) — this must never be wired to an auto-restart action. |
+| `READINESS_MAX_STALENESS_SECONDS` | No | How old (in seconds) the oldest pending spool item may get before `/readyz` reports unhealthy (default: `900`, i.e. 15 minutes) |
 | `GATEWAY_PORT` | No | Server port (default: 8080) |
 | `REPORTING_THRESHOLD` | No | AML reporting limit (default: 10000) |
 | `CONFIG_PATH` | No | Path to config JSON file (default: /config/gateway.json) |

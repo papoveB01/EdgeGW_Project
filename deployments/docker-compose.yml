@@ -59,6 +59,12 @@ services:
       # Durable queue: signals survive destination outages and gateway restarts
       - SPOOL_DIR=${SPOOL_DIR:-/spool}
       - SPOOL_MAX_DEPTH=${SPOOL_MAX_DEPTH:-10000}
+      # Readiness thresholds for /readyz (spool backlog/staleness). This is
+      # NOT the liveness endpoint the healthcheck below calls - /readyz must
+      # never be wired to an auto-restart action; see README's API Endpoints
+      # section.
+      - READINESS_MAX_DEPTH_RATIO=${READINESS_MAX_DEPTH_RATIO:-0.95}
+      - READINESS_MAX_STALENESS_SECONDS=${READINESS_MAX_STALENESS_SECONDS:-900}
     volumes:
       - ./config:/config:ro
       - spool-data:/spool

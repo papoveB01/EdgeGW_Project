@@ -15,6 +15,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -30,10 +31,25 @@ const deadDirName = "dead"
 type ForwardFunc func(ctx context.Context, payload []byte) error
 
 // Hooks let the spool report events without depending on a metrics package.
+// The spool package must stay free of any dependency on internal/adapters,
+// so callers (main.go) wire these to whatever metrics/health machinery they
+// use.
 type Hooks struct {
-	OnDelivered func()
-	OnDead      func()
-	OnDepth     func(depth int)
+	// OnDelivered fires after a signal is successfully forwarded. queueTime
+	// is how long the signal waited in the spool (enqueue to delivery) and
+	// is the delivery-latency measure for freshness metrics.
+	OnDelivered func(queueTime time.Duration)
+	// OnDead fires when a signal is moved to the dead-letter directory.
+	OnDead func()
+	// OnFailed fires on every retryable delivery attempt that fails (not
+	// just the final give-up), so failures are observable while the spool
+	// is stuck retrying a head-of-line item under backoff.
+	OnFailed func()
+	// OnDepth fires whenever the pending count changes.
+	OnDepth func(depth int)
+	// OnOldestPendingAge fires whenever the age of the oldest pending item
+	// is recomputed. ageSeconds is 0 when the queue is empty.
+	OnOldestPendingAge func(ageSeconds float64)
 }
 
 // Spool is a durable oldest-first delivery queue.
@@ -44,10 +60,11 @@ type Spool struct {
 	isPermanent func(error) bool
 	hooks       Hooks
 
-	mu    sync.Mutex
-	depth int
-	seq   uint64
-	wake  chan struct{}
+	mu              sync.Mutex
+	depth           int
+	seq             uint64
+	oldestPendingAt time.Time // zero value means no pending signal
+	wake            chan struct{}
 }
 
 // New opens (or creates) a spool directory and counts any signals left over
@@ -70,6 +87,7 @@ func New(dir string, maxDepth int, forward ForwardFunc, isPermanent func(error) 
 	}
 	s.depth = len(pending)
 	s.reportDepth()
+	s.updateOldestPending(pending)
 	return s, nil
 }
 
@@ -78,6 +96,26 @@ func (s *Spool) Depth() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.depth
+}
+
+// MaxDepth returns the spool's configured depth ceiling. It never changes
+// after New, so it needs no locking.
+func (s *Spool) MaxDepth() int {
+	return s.maxDepth
+}
+
+// OldestPendingAge reports how long the oldest pending signal has been
+// waiting, as of now. hasPending is false when the queue is empty. This
+// reads a cached, in-memory value only (no disk I/O), so it is cheap enough
+// to call from a health check on every request.
+func (s *Spool) OldestPendingAge(now time.Time) (age time.Duration, hasPending bool) {
+	s.mu.Lock()
+	t := s.oldestPendingAt
+	s.mu.Unlock()
+	if t.IsZero() {
+		return 0, false
+	}
+	return now.Sub(t), true
 }
 
 // Enqueue durably persists one marshaled signal (write temp + rename, so a
@@ -159,11 +197,13 @@ func (s *Spool) forwardOldest(ctx context.Context) (progressed bool, err error) 
 	if err != nil {
 		return false, err
 	}
+	s.updateOldestPending(pending)
 	if len(pending) == 0 {
 		return false, nil
 	}
 	name := pending[0]
 	path := filepath.Join(s.dir, name)
+	enqueuedAt, _ := parseSpoolTime(name)
 
 	payload, err := os.ReadFile(path)
 	if err != nil {
@@ -178,13 +218,20 @@ func (s *Spool) forwardOldest(ctx context.Context) (progressed bool, err error) 
 			s.deadLetter(name)
 			return true, nil
 		}
+		if s.hooks.OnFailed != nil {
+			s.hooks.OnFailed()
+		}
 		return false, err
 	}
 
 	os.Remove(path)
 	s.decDepth()
 	if s.hooks.OnDelivered != nil {
-		s.hooks.OnDelivered()
+		var queueTime time.Duration
+		if !enqueuedAt.IsZero() {
+			queueTime = time.Since(enqueuedAt)
+		}
+		s.hooks.OnDelivered(queueTime)
 	}
 	return true, nil
 }
@@ -229,4 +276,54 @@ func (s *Spool) reportDepth() {
 	if s.hooks.OnDepth != nil {
 		s.hooks.OnDepth(s.Depth())
 	}
+}
+
+// updateOldestPending caches the enqueue time of the head of the pending
+// list (pending must already be sorted oldest-first, as listPending
+// returns) and reports it via OnOldestPendingAge. Callers must not hold s.mu.
+//
+// If the head's filename can't be parsed (it should always be one this
+// package wrote, but disk state can surprise you), this deliberately fails
+// toward "assume stale" rather than toward "no pending": a freshness signal
+// that silently reports an item as not-pending because its timestamp was
+// unreadable would hide a real backlog from staleness alerting, which is
+// the wrong direction to fail in. So an unparseable name gets the Unix
+// epoch as its enqueue time, guaranteeing a large, alarm-tripping age
+// instead of a reassuring zero.
+func (s *Spool) updateOldestPending(pending []string) {
+	var t time.Time
+	if len(pending) > 0 {
+		if parsed, ok := parseSpoolTime(pending[0]); ok {
+			t = parsed
+		} else {
+			slog.Warn("Unparseable spool filename, reporting oldest-pending age conservatively (assumed stale)",
+				"file", pending[0])
+			t = time.Unix(0, 0)
+		}
+	}
+	s.mu.Lock()
+	s.oldestPendingAt = t
+	s.mu.Unlock()
+
+	if s.hooks.OnOldestPendingAge != nil {
+		if t.IsZero() {
+			s.hooks.OnOldestPendingAge(0)
+		} else {
+			s.hooks.OnOldestPendingAge(time.Since(t).Seconds())
+		}
+	}
+}
+
+// parseSpoolTime recovers the enqueue timestamp encoded in a spool filename
+// (the "<zero-padded unixnano>-<seq>.json" scheme documented on Enqueue).
+func parseSpoolTime(name string) (time.Time, bool) {
+	idx := strings.IndexByte(name, '-')
+	if idx <= 0 {
+		return time.Time{}, false
+	}
+	nanos, err := strconv.ParseInt(name[:idx], 10, 64)
+	if err != nil {
+		return time.Time{}, false
+	}
+	return time.Unix(0, nanos), true
 }

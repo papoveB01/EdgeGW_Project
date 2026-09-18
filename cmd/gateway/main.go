@@ -101,6 +101,30 @@ func main() {
 		slog.Info("Standalone mode: signals are written locally, not forwarded anywhere", "sink_dir", sinkDir)
 	}
 
+	// Readiness thresholds: egress is one-way (no score ever comes back
+	// through the gateway), so /readyz and /metrics are the only way to
+	// tell a healthy feed from one stuck hours behind. Read directly from
+	// the environment rather than internal/config so this stays a
+	// self-contained observability concern.
+	//
+	// This is deliberately NOT wired to /health (liveness): a full or
+	// stale spool during a vendor outage is the durable queue working as
+	// designed, not a dead process, and restarting fixes neither. See
+	// ReadinessCheckHandler's doc comment in internal/adapters/inbound.go.
+	readinessMaxDepthRatio := adapters.DefaultReadinessMaxDepthRatio
+	if v := os.Getenv("READINESS_MAX_DEPTH_RATIO"); v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil && f > 0 && f <= 1 {
+			readinessMaxDepthRatio = f
+		}
+	}
+	readinessMaxStaleness := adapters.DefaultReadinessMaxStaleness
+	if v := os.Getenv("READINESS_MAX_STALENESS_SECONDS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			readinessMaxStaleness = time.Duration(n) * time.Second
+		}
+	}
+	adapters.SetReadinessThresholds(readinessMaxDepthRatio, readinessMaxStaleness)
+
 	// Durable spool (recommended): /process persists anonymized signals and
 	// returns 202; a background forwarder delivers them, so an outage of the
 	// destination (vendor platform, or a full/unwritable sink disk) neither
@@ -115,14 +139,28 @@ func main() {
 		}
 		var err error
 		sp, err = spool.New(spoolDir, maxDepth, deliver, adapters.IsPermanent, spool.Hooks{
-			OnDelivered: func() { adapters.RecordMetric("signals_forwarded", 1) },
+			OnDelivered: func(queueTime time.Duration) { adapters.RecordDelivery(queueTime) },
 			OnDead:      func() { adapters.RecordMetric("signals_dead_lettered", 1) },
+			OnFailed:    func() { adapters.RecordMetric("delivery_attempt_failures", 1) },
 			OnDepth:     func(d int) { adapters.SetGauge("spool_depth", int64(d)) },
+			OnOldestPendingAge: func(ageSeconds float64) {
+				adapters.SetGauge("spool_oldest_pending_age_seconds", int64(ageSeconds))
+			},
 		})
 		if err != nil {
 			slog.Error("Failed to open spool", "dir", spoolDir, "error", err)
 			os.Exit(1)
 		}
+		adapters.SetGauge("spool_max_depth", int64(maxDepth))
+		adapters.SetReadinessSpoolStatus(func() adapters.SpoolStatus {
+			age, hasPending := sp.OldestPendingAge(time.Now())
+			return adapters.SpoolStatus{
+				Depth:            sp.Depth(),
+				MaxDepth:         sp.MaxDepth(),
+				OldestPendingAge: age,
+				HasPending:       hasPending,
+			}
+		})
 		slog.Info("Durable spool enabled", "dir", spoolDir, "max_depth", maxDepth, "pending", sp.Depth())
 	} else if cfg.IsStandalone() {
 		slog.Warn("SPOOL_DIR not set - writing to the local sink synchronously; a slow/unwritable disk blocks /process")
@@ -139,7 +177,11 @@ func main() {
 
 	mux := http.NewServeMux()
 
+	// /health is LIVENESS only (safe to wire to an auto-restart action);
+	// /readyz reports degradation (spool backlog/staleness) and must never
+	// be wired to auto-restart — see both handlers' doc comments.
 	mux.HandleFunc("/health", adapters.HealthCheckHandler)
+	mux.HandleFunc("/readyz", adapters.ReadinessCheckHandler)
 	mux.HandleFunc("/metrics", adapters.MetricsHandler)
 	mux.Handle("/process", middleware.RequireAPIKey(processTransaction(sp, syncForward, pepper), inboundKey))
 
@@ -291,7 +333,14 @@ func resolvePepper(cfg *config.GatewayConfig) (pepper string, derived bool) {
 	return "", false
 }
 
-// healthcheck probes the local /health endpoint and returns a process exit code.
+// healthcheck probes the local /health (liveness) endpoint and returns a
+// process exit code. This backs the Docker HEALTHCHECK in
+// deployments/docker-compose.yml, and a non-zero exit is what an
+// orchestrator or autoheal sidecar would act on to restart the container.
+// It must keep pointing at /health, never /readyz: readiness/degradation
+// (spool backlog or staleness) is not something a restart can fix, and
+// restarting for it would only add a self-inflicted /process outage on top
+// of a vendor outage the spool already exists to absorb.
 func healthcheck() int {
 	port := os.Getenv("GATEWAY_PORT")
 	if port == "" {

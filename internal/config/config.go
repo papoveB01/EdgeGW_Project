@@ -33,9 +33,18 @@ type GatewayConfig struct {
 	// behavior) forwards anonymized signals to an external vendor platform;
 	// ModeStandalone runs with no external system and requires none of the
 	// Hub/vendor credentials.
-	Mode  string      `json:"mode"`
-	Hub   HubParams   `json:"hub"`
-	Local LocalParams `json:"local"`
+	Mode string `json:"mode"`
+	// MosaicKeying selects how internal/processor.AnonymizeSignal keys
+	// identity/destination mosaics: MosaicKeyingBank (default) folds this
+	// institution's BANK_SALT into every mosaic; MosaicKeyingRegional
+	// (opt-in) keys national-ID-derived mosaics on the shared pepper alone,
+	// preserving cross-gateway derivability for a future regional querying
+	// use case. See processor.KeyingBank/KeyingRegional for the derivation
+	// details and processor.ScopeBank/ScopeRegional for what it means on the
+	// wire.
+	MosaicKeying string      `json:"mosaic_keying"`
+	Hub          HubParams   `json:"hub"`
+	Local        LocalParams `json:"local"`
 }
 
 const (
@@ -46,6 +55,20 @@ const (
 	// ModeStandalone runs the gateway independent of any external system;
 	// signals are written to a local durable sink instead of forwarded.
 	ModeStandalone = "standalone"
+)
+
+const (
+	// MosaicKeyingBank is the default MosaicKeying value: every mosaic folds
+	// in this institution's own BANK_SALT, so it is not reproducible by
+	// anyone lacking that secret. The pepper (MOSAIC_PEPPER/REGIONAL_PEPPER)
+	// is optional in this mode.
+	MosaicKeyingBank = "bank"
+	// MosaicKeyingRegional is the opt-in MosaicKeying value: mosaics derived
+	// from a canonical national ID are keyed on the shared pepper alone,
+	// exactly like the pre-v3 scheme, so every gateway sharing that pepper
+	// derives the same mosaic for the same person. The pepper is REQUIRED in
+	// this mode — main.validateStartup fails fast at startup if it is unset.
+	MosaicKeyingRegional = "regional"
 )
 
 // IsStandalone reports whether the gateway is configured to run without any
@@ -82,6 +105,7 @@ func Load() *GatewayConfig {
 		fileCfg := &GatewayConfig{}
 		if err := json.NewDecoder(f).Decode(fileCfg); err == nil {
 			cfg.Mode = fileCfg.Mode
+			cfg.MosaicKeying = fileCfg.MosaicKeying
 			cfg.Hub = fileCfg.Hub
 			cfg.Local.BankSalt = fileCfg.Local.BankSalt
 			if len(fileCfg.Local.InternalAdapterConfig) > 0 {
@@ -99,6 +123,9 @@ func Load() *GatewayConfig {
 	// 2. Environment variables override file values.
 	if v := os.Getenv("GATEWAY_MODE"); v != "" {
 		cfg.Mode = v
+	}
+	if v := os.Getenv("MOSAIC_KEYING"); v != "" {
+		cfg.MosaicKeying = v
 	}
 	if v := os.Getenv("INSTITUTION_ID"); v != "" {
 		cfg.Hub.InstitutionID = v
@@ -132,6 +159,10 @@ func Load() *GatewayConfig {
 	cfg.Mode = strings.ToLower(strings.TrimSpace(cfg.Mode))
 	if cfg.Mode == "" {
 		cfg.Mode = ModeMiddleware
+	}
+	cfg.MosaicKeying = strings.ToLower(strings.TrimSpace(cfg.MosaicKeying))
+	if cfg.MosaicKeying == "" {
+		cfg.MosaicKeying = MosaicKeyingBank
 	}
 	if cfg.Local.LocalLogRetentionDays <= 0 {
 		cfg.Local.LocalLogRetentionDays = 90

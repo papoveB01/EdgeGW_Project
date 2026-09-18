@@ -1,4 +1,6 @@
 {
+  "mode": "middleware",
+  "mosaic_keying": "bank",
   "hub": {
     "institution_id": "YOUR_INSTITUTION_ID",
     "api_key": "YOUR_API_KEY_FROM_HUB",

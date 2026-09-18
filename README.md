@@ -38,27 +38,45 @@ make docker-run
 
 ## Anonymization Pipeline
 
-| Raw PII Field | Anonymized Output | Method |
-|---------------|-------------------|--------|
-| National ID (BVN/NIN) | `identity_mosaic` (scope `global`) | HMAC-SHA256(key=regional_pepper, "v2\|id\|" + normalized national_id) |
-| Customer ID + Name (fallback) | `identity_mosaic` (scope `local`) | HMAC-SHA256(key=bank_salt\|pepper, "v2\|local\|" + normalized id\|name) |
-| Transaction Amount | `amount_tier` | TIER_1 (≤$500), TIER_2 ($500–2.5K), TIER_3 ($2.5K–10K), TIER_4 (>$10K) |
-| Lat/Long (optional) | `location_zone` | Geohash precision 5 (~4.9km grid cells); `ZONE_UNKNOWN` when absent |
-| Timestamp | Bucketed timestamp | RFC 3339, normalized to UTC, rounded down to 15-minute windows |
-| Account Number | `account_hash` | SHA-256(account \| bank_salt) |
-| Device ID | `device_id_hash` | SHA-256(device_id \| bank_salt) |
-| IP Address | `ip_hash` | SHA-256(ip \| bank_salt) |
-| Counterparty National ID | `destination_mosaic` (scope `global`) | Same derivation as global identity mosaic |
-| Counterparty ID (fallback) | `destination_mosaic` (scope `local`) | HMAC-SHA256(key=bank_salt\|pepper, "v2\|local\|" + normalized counterparty_id) |
+`identity_mosaic`/`destination_mosaic` keying depends on the deployment's
+`MOSAIC_KEYING` setting — `bank` (default) or `regional`. See
+[Mosaic scopes (v3)](#mosaic-scopes-v3) below for what that changes.
 
-### Mosaic scopes (v2)
+| Raw PII Field | Anonymized Output | Method (`MOSAIC_KEYING=bank`, default) | Method (`MOSAIC_KEYING=regional`) |
+|---------------|-------------------|------------------------------------------|-------------------------------------|
+| National ID (BVN/NIN) | `identity_mosaic` (scope `bank`/`regional`, basis `national_id`) | HMAC-SHA256(key=bank_salt[\|pepper], "v3\|id\|" + normalized national_id) | HMAC-SHA256(key=pepper, "v3\|id\|" + normalized national_id) |
+| Customer ID + Name (fallback) | `identity_mosaic` (scope `bank`, basis `internal_id_fallback`) | HMAC-SHA256(key=bank_salt[\|pepper], "v3\|local\|" + normalized id\|name) | same as bank mode — fallback is always bank-scoped |
+| Transaction Amount | `amount_tier` | TIER_1 (≤$500), TIER_2 ($500–2.5K), TIER_3 ($2.5K–10K), TIER_4 (>$10K) | — |
+| Lat/Long (optional) | `location_zone` | Geohash precision 5 (~4.9km grid cells); `ZONE_UNKNOWN` when absent | — |
+| Timestamp | Bucketed timestamp | RFC 3339, normalized to UTC, rounded down to 15-minute windows | — |
+| Account Number | `account_hash` | HMAC-SHA256(key=bank_salt, "v3\|account\|" + account) | same |
+| Device ID | `device_id_hash` | HMAC-SHA256(key=bank_salt, "v3\|device\|" + device_id) | same |
+| IP Address | `ip_hash` | HMAC-SHA256(key=bank_salt, "v3\|ip\|" + ip) | same |
+| Counterparty National ID | `destination_mosaic` (scope `bank`/`regional`, basis `national_id`) | Same derivation as the corresponding identity mosaic above | same |
+| Counterparty ID (fallback) | `destination_mosaic` (scope `bank`, basis `internal_id_fallback`) | HMAC-SHA256(key=bank_salt[\|pepper], "v3\|local\|" + normalized counterparty_id) | same |
 
-Every signal carries `mosaic_scope` and `mosaic_version` so the Hub knows what it can match:
+`[\|pepper]` means the pepper is folded in only when set — it's optional in
+`bank` mode. See [Configuration](#environment-variables) for `MOSAIC_PEPPER`.
 
-- **`global`** — derived from a canonical national identifier (BVN/NIN) keyed *only* with the shared `REGIONAL_PEPPER`. The same person produces the same mosaic at every member bank, enabling cross-institutional pattern detection. Identifiers are normalized (case, whitespace, dashes) before hashing, and the global destination-mosaic derivation matches the identity derivation — so mule-route hops link up.
-- **`local`** — fallback when no national ID is supplied. Keyed with the bank salt as well, so it's stable within one institution only; the Hub should not attempt cross-bank matching on local mosaics.
+**Flag-day break:** this is mosaic version 3 (`mosaic_version: 3`). v3
+mosaics never collide with v2 ones — the domain prefixes changed from
+`"v2|..."` to `"v3|..."` and the default keying changed from "pepper alone"
+to "this institution's own salt, always folded in." There is no dual
+emission; see `docs/signal-schema-v2.md` for the full wire-format writeup
+(the file keeps its old name for link continuity, but documents v3).
 
-Send `national_id` (and `counterparty_national_id` on transfers) whenever available — without them, signals still contribute to single-institution detection but not cross-bank correlation.
+### Mosaic scopes (v3)
+
+Every signal carries `mosaic_scope`, `mosaic_basis`, and `mosaic_version` — two independent facts, not one combined flag like the old v2 `mosaic_scope`:
+
+- **`mosaic_scope`** — which secret keyed the mosaic, i.e. whether it's valid to compare across institutions:
+  - **`bank`** (produced whenever `MOSAIC_KEYING=bank`, the default, or as the fallback basis under either setting) — keyed with this institution's own `BANK_SALT`. Never comparable to a mosaic from a different institution, regardless of what identifier produced it.
+  - **`regional`** (produced only for national-ID mosaics under `MOSAIC_KEYING=regional`) — keyed on the shared pepper alone, exactly like the old global scope. Comparable across every gateway sharing that pepper. This deliberately re-introduces cross-gateway derivability (anyone holding the pepper can enumerate the national-ID space) — opt in only when that tradeoff is understood; see the `MOSAIC_KEYING` row in [Configuration](#environment-variables).
+- **`mosaic_basis`** — what identifier produced the mosaic, independent of scope:
+  - **`national_id`** — derived from a canonical national identifier (BVN/NIN). Stable.
+  - **`internal_id_fallback`** — no national ID was supplied; falls back to a bank-internal identifier (plus name, for identity mosaics). Weaker — changes if the internal ID changes or a name is corrected. Always `mosaic_scope: "bank"`.
+
+Send `national_id` (and `counterparty_national_id` on transfers) whenever available for the more stable `national_id` basis; without them, signals fall back to `internal_id_fallback`, which still supports single-institution detection.
 
 ## API Endpoints
 
@@ -105,9 +123,9 @@ The gateway runs in one of two modes, set with `GATEWAY_MODE`:
 - **`middleware`** (default, for backward compatibility) — one-way egress to an
   external vendor fraud platform (inference only; the vendor never trains on
   this data, and never sends anything back over this channel). Requires
-  `HUB_API_URL`, `API_KEY`, `HMAC_SECRET`, and `REGIONAL_PEPPER`. If any of
-  these is missing, the gateway **fails fast at startup** with a clear error —
-  it no longer silently starts up and POSTs to a placeholder host.
+  `HUB_API_URL`, `API_KEY`, and `HMAC_SECRET`. If any of these is missing, the
+  gateway **fails fast at startup** with a clear error — it no longer silently
+  starts up and POSTs to a placeholder host.
 - **`standalone`** — the gateway runs independent of any external system.
   None of the vendor-facing settings above are required. Anonymized signals
   are instead written to local durable storage (newline-delimited JSON, one
@@ -119,31 +137,38 @@ The gateway runs in one of two modes, set with `GATEWAY_MODE`:
 Both modes still require `INSTITUTION_ID` and `BANK_SALT`: they drive local
 pseudonymization regardless of where (or whether) signals leave the bank.
 
-**Standalone mode and `REGIONAL_PEPPER`:** global-scope mosaics (produced
-whenever a `national_id` is supplied) are a keyed HMAC — `HMACHash(pepper,
-"v2|id|"+national_id)`. An HMAC keyed with an *empty* string is a publicly
-computable function with no secret in it, and a national ID (BVN/NIN) is only
-an 11-digit space — trivially enumerable offline. Standalone mode never runs
-that derivation with an empty key: if `REGIONAL_PEPPER` is unset (the normal
-case, since it isn't required), the gateway derives a deployment-local pepper
-from `BANK_SALT` instead and logs that it did so once at startup. The
-practical consequence is that **`BANK_SALT` secrecy is what protects the
-mosaics written to the local sink** in standalone mode — treat it accordingly.
-These bank-local mosaics are also not comparable across banks or to anything
-derived with a real `REGIONAL_PEPPER`, which is expected: standalone mode has
-no peer bank to match against in the first place.
+Separately from `GATEWAY_MODE`, **`MOSAIC_KEYING`** (`bank`, the default, or
+`regional`) controls how `identity_mosaic`/`destination_mosaic` are keyed —
+see [Mosaic scopes (v3)](#mosaic-scopes-v3). It applies in both `middleware`
+and `standalone` mode.
+
+**Pepper requirement now follows `MOSAIC_KEYING`, not `GATEWAY_MODE`:** in
+the default `bank` keying mode, every mosaic already folds in this
+institution's own `BANK_SALT` (`mosaicKeyMaterial(BANK_SALT, pepper)`), so
+`MOSAIC_PEPPER`/`REGIONAL_PEPPER` is **optional** — in both `middleware` and
+`standalone` mode. If set, it's folded in as additional key material
+(defense in depth); if unset, the key is `BANK_SALT` alone, which is a full
+HMAC key, never an empty one. In `regional` keying mode, the pepper is
+**required** — the gateway fails fast at startup if it's unset, since that
+mode's national-ID mosaics are keyed on the pepper *alone* and an
+HMAC keyed with an empty string is a publicly computable function with no
+secret in it (and a national ID is only an 11-digit space — trivially
+enumerable offline). This replaces the old standalone-only
+"derive-a-local-pepper-from-BANK_SALT" behavior, which existed only because
+v2's global mosaic had no bank-salt fallback to begin with.
 
 ### Environment Variables
 
 | Variable | Required | Description |
 |----------|----------|-------------|
 | `GATEWAY_MODE` | No | `middleware` (default) or `standalone` — see [Deployment modes](#deployment-modes) |
+| `MOSAIC_KEYING` | No | `bank` (default) or `regional` — see [Mosaic scopes (v3)](#mosaic-scopes-v3). Independent of `GATEWAY_MODE`. |
 | `INSTITUTION_ID` | Yes | Your institution's own identifier; used in local pseudonymization in both modes |
 | `API_KEY` | Yes, in `middleware` mode | API key for the vendor platform |
 | `HMAC_SECRET` | Yes, in `middleware` mode | HMAC signing secret for the vendor platform |
 | `HUB_API_URL` | Yes, in `middleware` mode | Vendor platform signal endpoint URL. There is no built-in default — an unset value fails startup instead of silently posting to a placeholder host |
 | `BANK_SALT` | Yes | Local salt for hashing (min 32 chars, never shared) |
-| `REGIONAL_PEPPER` | Yes, in `middleware` mode | HMAC key for global-scope mosaics. Not required in `standalone` mode — if unset there, a local pepper is derived from `BANK_SALT` instead (never an empty key; see [Deployment modes](#deployment-modes)) |
+| `MOSAIC_PEPPER` | Yes, in `MOSAIC_KEYING=regional` | Additional HMAC key input for mosaics. Optional in `MOSAIC_KEYING=bank` (the default) — `BANK_SALT` alone already keys every mosaic; if set, the pepper is folded in too as defense in depth. Required, and fails startup if unset, in `MOSAIC_KEYING=regional`. `REGIONAL_PEPPER` is accepted as a backward-compatible alias (if both are set, `MOSAIC_PEPPER` wins). |
 | `STANDALONE_SINK_DIR` | No | Directory for the local sink's newline-delimited JSON files in `standalone` mode (default: `./sink`; Docker default: `/sink`) |
 | `SPOOL_DIR` | Recommended | Durable queue directory; enables async 202 mode so a destination outage doesn't lose signals (Docker default: `/spool`) |
 | `SPOOL_MAX_DEPTH` | No | Max queued signals before /process returns 503 (default: 10000) |

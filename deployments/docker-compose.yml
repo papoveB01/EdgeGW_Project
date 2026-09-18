@@ -31,6 +31,13 @@ services:
       #   its way.
       - GATEWAY_MODE=${GATEWAY_MODE:-middleware}
 
+      # ─── Mosaic keying (independent of GATEWAY_MODE) ────────────────
+      # bank (default): every mosaic folds in BANK_SALT; MOSAIC_PEPPER
+      #   below is optional. regional: national-ID mosaics are keyed on
+      #   MOSAIC_PEPPER alone - REQUIRED in that mode. See .env.example
+      #   and README's Configuration section for the full tradeoff.
+      - MOSAIC_KEYING=${MOSAIC_KEYING:-bank}
+
       # ─── Vendor platform params (required in middleware mode only) ─
       # All three use ${VAR?...} (no colon - see comment above): fails
       # `docker compose up` with a clear one-line error if forgotten
@@ -40,12 +47,26 @@ services:
       - HUB_API_URL=${HUB_API_URL?Set HUB_API_URL (required in middleware mode, no placeholder default is used; set to an explicit empty value for standalone, e.g. HUB_API_URL= in .env)}
 
       # ─── Local params (managed by the bank, never sent externally) ─
-      # INSTITUTION_ID/BANK_SALT are required in BOTH modes (unlike the
-      # vendor params above), so they keep ${VAR:?...} - an empty value is
-      # never acceptable for them, in middleware or standalone.
+      # INSTITUTION_ID/BANK_SALT are required in BOTH modes, so they keep
+      # ${VAR:?...} - an empty value is never acceptable for them.
+      #
+      # MOSAIC_PEPPER/REGIONAL_PEPPER: the application (pepperEnv() in
+      # cmd/gateway/main.go) reads MOSAIC_PEPPER first and falls back to
+      # REGIONAL_PEPPER as a backward-compatible alias, so BOTH names must
+      # actually reach the container for that fallback to do anything -
+      # forwarding only one of them silently drops whichever one an
+      # existing deployment's .env happens to set. Passed through plainly
+      # with ${VAR:-} (no requiredness at the compose level): whether a
+      # pepper is required at all depends on MOSAIC_KEYING (required when
+      # =regional, optional when =bank, the default), which this compose
+      # file can't express with ${VAR?...}/${VAR:?...} - that condition is
+      # enforced at the application level instead (main.validateStartup
+      # fails startup fast when MOSAIC_KEYING=regional and neither is set).
+      # If both are set, MOSAIC_PEPPER wins, matching pepperEnv().
       - INSTITUTION_ID=${INSTITUTION_ID:?Set INSTITUTION_ID}
       - BANK_SALT=${BANK_SALT:?Set BANK_SALT (min 32 chars)}
-      - REGIONAL_PEPPER=${REGIONAL_PEPPER?Set REGIONAL_PEPPER (required in middleware mode; set to an explicit empty value for standalone, e.g. REGIONAL_PEPPER= in .env)}
+      - MOSAIC_PEPPER=${MOSAIC_PEPPER:-}
+      - REGIONAL_PEPPER=${REGIONAL_PEPPER:-}
 
       # ─── Standalone mode only (ignored in middleware mode) ─────────
       - STANDALONE_SINK_DIR=${STANDALONE_SINK_DIR:-/sink}

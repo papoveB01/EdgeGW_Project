@@ -55,11 +55,19 @@ func main() {
 		slog.Warn("INBOUND_API_KEY not set - /process accepts unauthenticated requests; set it in production")
 	}
 
-	// Pepper for global-scope mosaic derivation - see resolvePepper. Never
-	// the empty string, even in standalone mode.
-	pepper, pepperIsDerived := resolvePepper(cfg)
-	if pepperIsDerived {
-		slog.Info("Standalone mode: REGIONAL_PEPPER not set, deriving a local pepper from BANK_SALT - mosaics are bank-local only and not comparable to any mosaic derived with a real REGIONAL_PEPPER")
+	// Pepper input for mosaic derivation - see resolvePepper. May be empty:
+	// in MOSAIC_KEYING=bank (default) it's optional additional keying
+	// material, since BANK_SALT is always folded in. In
+	// MOSAIC_KEYING=regional, validateStartup already guarantees it's
+	// non-empty by the time we get here.
+	pepper := resolvePepper()
+	switch {
+	case cfg.MosaicKeying == config.MosaicKeyingRegional:
+		slog.Info("MOSAIC_KEYING=regional: identity/destination mosaics derived from a national ID are keyed on the shared pepper alone and are derivable cross-gateway by anyone holding it")
+	case pepper == "":
+		slog.Info("MOSAIC_KEYING=bank (default): pepper not set, mosaics keyed by BANK_SALT alone - this is not a weakened mosaic, BANK_SALT is always folded in")
+	default:
+		slog.Info("MOSAIC_KEYING=bank (default): pepper set, folded in alongside BANK_SALT as additional key material")
 	}
 
 	// Delivery destination: middleware forwards one-way to the external
@@ -255,16 +263,22 @@ func main() {
 }
 
 // validateStartup returns a human-readable problem for every required
-// setting that is missing, given the selected GATEWAY_MODE. institution_id
-// and bank_salt are always required - they drive local pseudonymization
-// regardless of where (or whether) signals go. Everything needed only to
-// reach an external vendor platform (API key, destination URL, HMAC secret)
-// is required in middleware mode and not required at all in standalone mode.
+// setting that is missing, given the selected GATEWAY_MODE and
+// MOSAIC_KEYING. institution_id and bank_salt are always required - they
+// drive local pseudonymization regardless of where (or whether) signals go.
+// Everything needed only to reach an external vendor platform (API key,
+// destination URL, HMAC secret) is required in middleware mode and not
+// required at all in standalone mode.
 //
-// REGIONAL_PEPPER keys the global-scope mosaic derivation that exists to let
-// a peer bank derive the same pseudonym; that only matters in middleware mode
-// (see CLAUDE.md), so it stays required there for backward compatibility and
-// is not required in standalone mode.
+// The pepper (MOSAIC_PEPPER, or its backward-compatible alias
+// REGIONAL_PEPPER - see pepperEnv) is a separate, orthogonal requirement
+// keyed off MOSAIC_KEYING, not GATEWAY_MODE: it is REQUIRED when
+// MOSAIC_KEYING=regional (that mode's whole point is cross-gateway
+// derivability, which needs a shared secret) and OPTIONAL when
+// MOSAIC_KEYING=bank, the default (every mosaic already folds in this
+// institution's own BANK_SALT - see internal/processor.mosaicKeyMaterial -
+// so an unset pepper there is not an empty-key-HMAC risk the way it was
+// before this mosaic scheme existed).
 func validateStartup(cfg *config.GatewayConfig) []string {
 	var problems []string
 
@@ -277,8 +291,8 @@ func validateStartup(cfg *config.GatewayConfig) []string {
 
 	switch cfg.Mode {
 	case config.ModeStandalone:
-		// No external platform: hub.api_key, HUB_API_URL, HMAC_SECRET and
-		// REGIONAL_PEPPER are not needed - signals go to the local sink.
+		// No external platform: hub.api_key, HUB_API_URL and HMAC_SECRET are
+		// not needed - signals go to the local sink.
 	case config.ModeMiddleware:
 		if cfg.Hub.APIKey == "" {
 			problems = append(problems, "Required hub.api_key is not set (set API_KEY or provide config file) - required in middleware mode")
@@ -289,48 +303,47 @@ func validateStartup(cfg *config.GatewayConfig) []string {
 		if os.Getenv("HMAC_SECRET") == "" {
 			problems = append(problems, "Required HMAC_SECRET is not set - every forward to the vendor platform would fail (required in middleware mode)")
 		}
-		if os.Getenv("REGIONAL_PEPPER") == "" {
-			problems = append(problems, "Required REGIONAL_PEPPER is not set - it keys the global identity mosaics (required in middleware mode); set GATEWAY_MODE=standalone if there is no external platform")
-		}
 	default:
 		problems = append(problems, fmt.Sprintf("Unknown GATEWAY_MODE %q - must be %q or %q", cfg.Mode, config.ModeMiddleware, config.ModeStandalone))
+	}
+
+	switch cfg.MosaicKeying {
+	case config.MosaicKeyingBank:
+		// Pepper is optional - BANK_SALT alone is always folded into the key.
+	case config.MosaicKeyingRegional:
+		if pepperEnv() == "" {
+			problems = append(problems, "Required MOSAIC_PEPPER (or its alias REGIONAL_PEPPER) is not set - MOSAIC_KEYING=regional keys national-ID mosaics on the shared pepper alone, so it must be set for cross-gateway derivability to work at all; set MOSAIC_KEYING=bank if there is no shared pepper")
+		}
+	default:
+		problems = append(problems, fmt.Sprintf("Unknown MOSAIC_KEYING %q - must be %q or %q", cfg.MosaicKeying, config.MosaicKeyingBank, config.MosaicKeyingRegional))
 	}
 
 	return problems
 }
 
-// standalonePepperDomain is a fixed domain-separation string for the
-// deployment-local pepper standalone mode derives from BANK_SALT. It has no
-// secrecy value itself - BANK_SALT is what must stay secret - it just keeps
-// this derivation distinguishable from any other use of BANK_SALT.
-const standalonePepperDomain = "standalone-pepper-v1"
+// pepperEnv returns the configured mosaic pepper. MOSAIC_PEPPER is the
+// preferred name: REGIONAL_PEPPER described this as exclusively a
+// cross-region/cross-bank matching key, which stopped being accurate once
+// the pepper became optional additional keying material in the default
+// bank-scoped mode rather than the sole key for global mosaics.
+// REGIONAL_PEPPER is still accepted as a backward-compatible alias so
+// existing deployments' env/config don't break. If both are set,
+// MOSAIC_PEPPER wins.
+func pepperEnv() string {
+	if v := os.Getenv("MOSAIC_PEPPER"); v != "" {
+		return v
+	}
+	return os.Getenv("REGIONAL_PEPPER")
+}
 
-// resolvePepper returns the key used for global-scope mosaic derivation, and
-// whether it was derived (rather than taken from REGIONAL_PEPPER directly).
-//
-// In middleware mode this is always the shared REGIONAL_PEPPER
-// (validateStartup already guarantees it's non-empty there). In standalone
-// mode REGIONAL_PEPPER isn't required and is typically unset - but the
-// derivation must never run with an empty key: HMAC-SHA256("", msg) is a
-// publicly computable function with no secret in it, and a national ID
-// (BVN/NIN) is only an 11-digit space, so every global-scope mosaic written
-// to the sink would be trivially reversible offline by anyone who can read
-// those files. Standalone mode's whole premise is that data stays inside the
-// bank, so that would be a silent, serious weakening of the pseudonymization
-// the gateway advertises. So when REGIONAL_PEPPER is unset in standalone
-// mode, derive a deployment-local pepper from BANK_SALT instead - never hand
-// the derivation an empty key. BANK_SALT's secrecy is then what protects the
-// local sink data; see README's Configuration section. If an operator sets
-// REGIONAL_PEPPER explicitly even in standalone mode, that value is used
-// as-is.
-func resolvePepper(cfg *config.GatewayConfig) (pepper string, derived bool) {
-	if p := os.Getenv("REGIONAL_PEPPER"); p != "" {
-		return p, false
-	}
-	if cfg.IsStandalone() {
-		return processor.HMACHash(cfg.Local.BankSalt, standalonePepperDomain), true
-	}
-	return "", false
+// resolvePepper returns the pepper value passed into
+// processor.AnonymizeSignal as additional key material for mosaic
+// derivation. It may be empty - see validateStartup for when that's
+// required to not be the case (MOSAIC_KEYING=regional) versus fine
+// (MOSAIC_KEYING=bank, the default, where BANK_SALT alone already keys the
+// mosaic).
+func resolvePepper() string {
+	return pepperEnv()
 }
 
 // healthcheck probes the local /health (liveness) endpoint and returns a
@@ -369,9 +382,9 @@ func healthcheck() int {
 // With a spool: persist and return 202 Accepted (delivery is asynchronous).
 // Without: deliver synchronously via syncForward and return 200/502.
 // syncForward is mode-dependent: middleware forwards to the vendor platform
-// with bounded retry, standalone writes to the local sink. pepper is the key
-// for global-scope mosaic derivation, resolved once at startup (see main) -
-// never the empty string, even in standalone mode.
+// with bounded retry, standalone writes to the local sink. pepper is
+// additional key material for mosaic derivation, resolved once at startup
+// (see main) - it may be empty (see resolvePepper/validateStartup).
 func processTransaction(sp *spool.Spool, syncForward func(ctx context.Context, signal processor.AnonymizedSignal) error, pepper string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		startTime := time.Now()
@@ -392,7 +405,7 @@ func processTransaction(sp *spool.Spool, syncForward func(ctx context.Context, s
 		cfg := config.Get()
 		salt := cfg.Local.BankSalt
 
-		anonymized := processor.AnonymizeSignal(*rawData, cfg.Hub.InstitutionID, salt, pepper, cfg.Local.ReportingThreshold)
+		anonymized := processor.AnonymizeSignal(*rawData, cfg.Hub.InstitutionID, salt, pepper, cfg.MosaicKeying, cfg.Local.ReportingThreshold)
 
 		if sp != nil {
 			payload, err := json.Marshal(anonymized)

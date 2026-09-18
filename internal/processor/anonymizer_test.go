@@ -141,73 +141,197 @@ func TestValidate(t *testing.T) {
 	}
 }
 
-func TestAnonymizeSignal_GlobalMosaicCrossBank(t *testing.T) {
-	// Same person (same national ID) at two banks with different salts and
-	// different internal customer IDs must produce the SAME global mosaic.
+func TestAnonymizeSignal_BankKeyingMosaicDiffersAcrossBanks(t *testing.T) {
+	// KeyingBank is the default and MUST NOT allow two different banks
+	// (different BANK_SALT) to derive the same mosaic for the same person,
+	// even when they share a pepper and even for the SAME national ID. This
+	// replaces the old (pre-v3) TestAnonymizeSignal_GlobalMosaicCrossBank,
+	// whose premise (same national ID -> same mosaic across banks, with no
+	// bank secret involved) is exactly the enumerable-mosaic-table risk this
+	// change closes.
 	atBankA := RawData{ID: "CUST-001", Name: "John Doe", NationalID: "22345678901",
 		Account: "ACC-A", Amount: 100, Timestamp: "2026-01-01T00:00:00Z"}
 	atBankB := RawData{ID: "CIF-99887", Name: "DOE, JOHN", NationalID: "2234-5678 901",
 		Account: "ACC-B", Amount: 100, Timestamp: "2026-01-01T00:00:00Z"}
 
-	sigA := AnonymizeSignal(atBankA, "BNK_A", "salt_a", "shared_pepper", 10000)
-	sigB := AnonymizeSignal(atBankB, "BNK_B", "salt_b", "shared_pepper", 10000)
+	sigA := AnonymizeSignal(atBankA, "BNK_A", "salt_a", "shared_pepper", KeyingBank, 10000)
+	sigB := AnonymizeSignal(atBankB, "BNK_B", "salt_b", "shared_pepper", KeyingBank, 10000)
 
-	if sigA.IdentityMosaic != sigB.IdentityMosaic {
-		t.Error("same national ID at different banks must produce the same global mosaic")
+	if sigA.IdentityMosaic == sigB.IdentityMosaic {
+		t.Error("bank-keyed mosaics for the same national ID must differ across banks with different BANK_SALT")
 	}
-	if sigA.MosaicScope != ScopeGlobal || sigB.MosaicScope != ScopeGlobal {
-		t.Errorf("expected global scope, got %s / %s", sigA.MosaicScope, sigB.MosaicScope)
+	if sigA.MosaicScope != ScopeBank || sigB.MosaicScope != ScopeBank {
+		t.Errorf("expected bank scope, got %s / %s", sigA.MosaicScope, sigB.MosaicScope)
+	}
+	if sigA.MosaicBasis != BasisNationalID || sigB.MosaicBasis != BasisNationalID {
+		t.Errorf("expected national_id basis, got %s / %s", sigA.MosaicBasis, sigB.MosaicBasis)
 	}
 	if sigA.MosaicVersion != MosaicVersion {
 		t.Errorf("expected mosaic version %d, got %d", MosaicVersion, sigA.MosaicVersion)
 	}
 
-	// Different pepper must produce a different mosaic (pepper is the key).
-	sigC := AnonymizeSignal(atBankA, "BNK_A", "salt_a", "other_pepper", 10000)
-	if sigC.IdentityMosaic == sigA.IdentityMosaic {
-		t.Error("different pepper must change the global mosaic")
+	// Same bank, same identity, but WITHOUT a shared pepper must still
+	// reproduce the same mosaic as WITH one dropped on the other side, as
+	// long as salt matches - the point of bank mode is that BANK_SALT alone
+	// is sufficient. Demonstrate the opposite too: a different pepper with
+	// the same salt still changes the mosaic (defense in depth).
+	sigNoPepper := AnonymizeSignal(atBankA, "BNK_A", "salt_a", "", KeyingBank, 10000)
+	if sigNoPepper.IdentityMosaic == sigA.IdentityMosaic {
+		t.Error("dropping the pepper (with the same salt) must change the mosaic - pepper is folded in as additional key material when present")
+	}
+
+	sigOtherPepper := AnonymizeSignal(atBankA, "BNK_A", "salt_a", "other_pepper", KeyingBank, 10000)
+	if sigOtherPepper.IdentityMosaic == sigA.IdentityMosaic {
+		t.Error("expected sanity: different pepper values should be exercised as different mosaics")
+	}
+
+	// Different salt alone (pepper empty on both sides) must still change
+	// the mosaic - BANK_SALT is what protects a bank-keyed mosaic when no
+	// pepper is configured at all.
+	sigA2 := AnonymizeSignal(atBankA, "BNK_A", "salt_a", "", KeyingBank, 10000)
+	sigB2 := AnonymizeSignal(atBankA, "BNK_A", "salt_b_different", "", KeyingBank, 10000)
+	if sigA2.IdentityMosaic == sigB2.IdentityMosaic {
+		t.Error("different BANK_SALT with no pepper configured must still produce different mosaics")
 	}
 }
 
-func TestAnonymizeSignal_LocalMosaicFallback(t *testing.T) {
-	// Without a national ID the mosaic is bank-local: salted, scope=local,
-	// and name casing/spacing differences don't split identities.
+func TestAnonymizeSignal_RegionalKeyingMosaicIdenticalAcrossBanks(t *testing.T) {
+	// KeyingRegional is the opt-in mode that intentionally preserves the old
+	// cross-gateway-derivable behavior: same national ID + same shared
+	// pepper must produce the SAME mosaic regardless of each bank's own
+	// salt or internal customer ID. This is the companion to
+	// TestAnonymizeSignal_BankKeyingMosaicDiffersAcrossBanks, proving the two
+	// modes are genuinely different and that regional mode still works as
+	// documented for its intended future remote-gateway use case.
+	atBankA := RawData{ID: "CUST-001", Name: "John Doe", NationalID: "22345678901",
+		Account: "ACC-A", Amount: 100, Timestamp: "2026-01-01T00:00:00Z"}
+	atBankB := RawData{ID: "CIF-99887", Name: "DOE, JOHN", NationalID: "2234-5678 901",
+		Account: "ACC-B", Amount: 100, Timestamp: "2026-01-01T00:00:00Z"}
+
+	sigA := AnonymizeSignal(atBankA, "BNK_A", "salt_a", "shared_pepper", KeyingRegional, 10000)
+	sigB := AnonymizeSignal(atBankB, "BNK_B", "salt_b", "shared_pepper", KeyingRegional, 10000)
+
+	if sigA.IdentityMosaic != sigB.IdentityMosaic {
+		t.Error("regional-keyed mosaics for the same national ID and shared pepper must be identical across banks")
+	}
+	if sigA.MosaicScope != ScopeRegional || sigB.MosaicScope != ScopeRegional {
+		t.Errorf("expected regional scope, got %s / %s", sigA.MosaicScope, sigB.MosaicScope)
+	}
+	if sigA.MosaicBasis != BasisNationalID {
+		t.Errorf("expected national_id basis, got %s", sigA.MosaicBasis)
+	}
+
+	// Different pepper must still produce a different mosaic (pepper is the
+	// sole key in regional mode).
+	sigC := AnonymizeSignal(atBankA, "BNK_A", "salt_a", "other_pepper", KeyingRegional, 10000)
+	if sigC.IdentityMosaic == sigA.IdentityMosaic {
+		t.Error("different pepper must change the regional mosaic")
+	}
+
+	// A different bank salt must NOT change the mosaic in regional mode -
+	// that's the entire point of the mode (BANK_SALT is deliberately not
+	// part of the key here).
+	sigDifferentSaltSamePepper := AnonymizeSignal(atBankA, "BNK_A", "totally_different_salt", "shared_pepper", KeyingRegional, 10000)
+	if sigDifferentSaltSamePepper.IdentityMosaic != sigA.IdentityMosaic {
+		t.Error("regional mode must ignore BANK_SALT entirely for the national-ID mosaic")
+	}
+}
+
+func TestAnonymizeSignal_LocalFallbackAlwaysBankScopedRegardlessOfKeying(t *testing.T) {
+	// Without a national ID the mosaic falls back to internal ID + name. It
+	// must always fold in BANK_SALT and always report ScopeBank / a
+	// BasisInternalIDFallback basis - regardless of the configured
+	// MosaicKeying - because it has no cross-gateway meaning even in
+	// regional mode (it's tied to this bank's own internal identifiers).
 	raw1 := RawData{ID: "CUST-001", Name: "John Doe", Account: "A", Amount: 100, Timestamp: "2026-01-01T00:00:00Z"}
 	raw2 := RawData{ID: "cust-001", Name: "  JOHN   DOE ", Account: "A", Amount: 100, Timestamp: "2026-01-01T00:00:00Z"}
 
-	sig1 := AnonymizeSignal(raw1, "BNK", "salt", "pepper", 10000)
-	sig2 := AnonymizeSignal(raw2, "BNK", "salt", "pepper", 10000)
+	for _, keying := range []string{KeyingBank, KeyingRegional} {
+		sig1 := AnonymizeSignal(raw1, "BNK", "salt", "pepper", keying, 10000)
+		sig2 := AnonymizeSignal(raw2, "BNK", "salt", "pepper", keying, 10000)
 
-	if sig1.MosaicScope != ScopeLocal {
-		t.Errorf("expected local scope without national_id, got %s", sig1.MosaicScope)
-	}
-	if sig1.IdentityMosaic != sig2.IdentityMosaic {
-		t.Error("normalization should make casing/spacing variants produce the same local mosaic")
+		if sig1.MosaicScope != ScopeBank {
+			t.Errorf("keying=%s: expected ScopeBank for the local fallback, got %s", keying, sig1.MosaicScope)
+		}
+		if sig1.MosaicBasis != BasisInternalIDFallback {
+			t.Errorf("keying=%s: expected BasisInternalIDFallback, got %s", keying, sig1.MosaicBasis)
+		}
+		if sig1.IdentityMosaic != sig2.IdentityMosaic {
+			t.Errorf("keying=%s: normalization should make casing/spacing variants produce the same fallback mosaic", keying)
+		}
 	}
 
-	// Different salts (different banks) must produce different local mosaics.
-	sig3 := AnonymizeSignal(raw1, "BNK2", "other_salt", "pepper", 10000)
+	// Different salts (different banks) must produce different fallback
+	// mosaics, regardless of keying mode.
+	sig1 := AnonymizeSignal(raw1, "BNK", "salt", "pepper", KeyingBank, 10000)
+	sig3 := AnonymizeSignal(raw1, "BNK2", "other_salt", "pepper", KeyingBank, 10000)
 	if sig3.IdentityMosaic == sig1.IdentityMosaic {
-		t.Error("local mosaics must differ across banks (different salts)")
+		t.Error("fallback mosaics must differ across banks (different salts)")
+	}
+}
+
+func TestAnonymizeSignal_UnrecognizedKeyingFailsSafeToBank(t *testing.T) {
+	// An unrecognized keying value must not fall through to the more
+	// dangerous regional (pepper-alone) derivation - AnonymizeSignal treats
+	// anything other than exactly KeyingRegional as KeyingBank.
+	raw := RawData{ID: "1", Name: "Test", NationalID: "22345678901", Account: "ACC", Amount: 100, Timestamp: "2026-01-01T00:00:00Z"}
+
+	sigUnknown := AnonymizeSignal(raw, "BNK", "salt", "pepper", "not-a-real-mode", 10000)
+	sigBank := AnonymizeSignal(raw, "BNK", "salt", "pepper", KeyingBank, 10000)
+	sigRegional := AnonymizeSignal(raw, "BNK", "salt", "pepper", KeyingRegional, 10000)
+
+	if sigUnknown.IdentityMosaic != sigBank.IdentityMosaic || sigUnknown.MosaicScope != ScopeBank {
+		t.Error("unrecognized MosaicKeying value must behave exactly like KeyingBank")
+	}
+	if sigUnknown.IdentityMosaic == sigRegional.IdentityMosaic {
+		t.Error("unrecognized MosaicKeying value must not accidentally match the regional derivation")
 	}
 }
 
 func TestAnonymizeSignal_DestinationMatchesIdentity(t *testing.T) {
-	// A counterparty's global destination mosaic must equal the identity
-	// mosaic that counterparty produces for their own transactions.
 	sender := RawData{ID: "S", Name: "Sender", Account: "A1", Amount: 100, Timestamp: "2026-01-01T00:00:00Z",
 		CounterpartyID: "CP-1", CounterpartyNationalID: "99887766554"}
 	counterpartyOwnTxn := RawData{ID: "CP-1", Name: "Mule Person", NationalID: "99887766554",
 		Account: "A2", Amount: 50, Timestamp: "2026-01-01T00:00:00Z"}
 
-	sent := AnonymizeSignal(sender, "BNK_A", "salt_a", "pepper", 10000)
-	own := AnonymizeSignal(counterpartyOwnTxn, "BNK_B", "salt_b", "pepper", 10000)
-
-	if sent.DestinationMosaic != own.IdentityMosaic {
-		t.Error("global destination mosaic must match the counterparty's own identity mosaic")
+	// Bank mode, SAME institution: route-following within one bank must
+	// still work — sender and counterparty share BANK_SALT, so the
+	// destination mosaic (keyed with the sender's own salt) equals the
+	// mosaic the counterparty derives for their own transaction (keyed with
+	// that same salt, since it's the same bank).
+	sentSameBank := AnonymizeSignal(sender, "BNK_A", "salt_a", "pepper", KeyingBank, 10000)
+	ownSameBank := AnonymizeSignal(counterpartyOwnTxn, "BNK_A", "salt_a", "pepper", KeyingBank, 10000)
+	if sentSameBank.DestinationMosaic != ownSameBank.IdentityMosaic {
+		t.Error("bank-scoped destination mosaic must match the counterparty's own identity mosaic when produced by the SAME institution (same BANK_SALT)")
 	}
-	if sent.DestinationMosaicScope != ScopeGlobal {
-		t.Errorf("expected global destination scope, got %s", sent.DestinationMosaicScope)
+	if sentSameBank.DestinationMosaicScope != ScopeBank {
+		t.Errorf("expected bank destination scope, got %s", sentSameBank.DestinationMosaicScope)
+	}
+	if sentSameBank.DestinationMosaicBasis != BasisNationalID {
+		t.Errorf("expected national_id destination basis, got %s", sentSameBank.DestinationMosaicBasis)
+	}
+
+	// Bank mode, DIFFERENT institutions: this is the whole point of
+	// bank-scoping — a destination mosaic computed with the sender's own
+	// BANK_SALT must NOT match an identity mosaic the counterparty's own
+	// (different) bank derived with ITS salt. Cross-bank route-following
+	// does not work in bank mode, by design.
+	sentOtherBank := AnonymizeSignal(sender, "BNK_A", "salt_a", "pepper", KeyingBank, 10000)
+	ownOtherBank := AnonymizeSignal(counterpartyOwnTxn, "BNK_B", "salt_b", "pepper", KeyingBank, 10000)
+	if sentOtherBank.DestinationMosaic == ownOtherBank.IdentityMosaic {
+		t.Error("bank-scoped destination/identity mosaics must NOT match across different institutions (different BANK_SALT) - that cross-gateway comparability is exactly what bank scoping removes")
+	}
+
+	// Regional mode: the national-ID branch is keyed on the pepper alone,
+	// so cross-institution route-following is preserved exactly as before —
+	// this is the documented use case for opting into regional keying.
+	sentRegional := AnonymizeSignal(sender, "BNK_A", "salt_a", "pepper", KeyingRegional, 10000)
+	ownRegional := AnonymizeSignal(counterpartyOwnTxn, "BNK_B", "salt_b", "pepper", KeyingRegional, 10000)
+	if sentRegional.DestinationMosaic != ownRegional.IdentityMosaic {
+		t.Error("regional-scoped destination mosaic must match the counterparty's own identity mosaic across institutions")
+	}
+	if sentRegional.DestinationMosaicScope != ScopeRegional {
+		t.Errorf("expected regional destination scope, got %s", sentRegional.DestinationMosaicScope)
 	}
 }
 
@@ -228,8 +352,8 @@ func TestAnonymizeSignal_FieldDelimiters(t *testing.T) {
 	raw1 := RawData{ID: "ab", Name: "cd", Account: "1234", Amount: 100, Timestamp: "2026-01-01T00:00:00Z"}
 	raw2 := RawData{ID: "a", Name: "bcd", Account: "1234", Amount: 100, Timestamp: "2026-01-01T00:00:00Z"}
 
-	sig1 := AnonymizeSignal(raw1, "BNK", "salt", "pepper", 10000)
-	sig2 := AnonymizeSignal(raw2, "BNK", "salt", "pepper", 10000)
+	sig1 := AnonymizeSignal(raw1, "BNK", "salt", "pepper", KeyingBank, 10000)
+	sig2 := AnonymizeSignal(raw2, "BNK", "salt", "pepper", KeyingBank, 10000)
 
 	if sig1.IdentityMosaic == sig2.IdentityMosaic {
 		t.Error("field delimiter collision: different inputs produced same mosaic")
@@ -238,14 +362,14 @@ func TestAnonymizeSignal_FieldDelimiters(t *testing.T) {
 
 func TestAnonymizeSignal_NearThreshold(t *testing.T) {
 	raw := RawData{ID: "1", Name: "Test", Account: "ACC", Amount: 9600, Timestamp: "2026-01-01T00:00:00Z"}
-	sig := AnonymizeSignal(raw, "BNK", "salt", "pepper", 10000)
+	sig := AnonymizeSignal(raw, "BNK", "salt", "pepper", KeyingBank, 10000)
 
 	if _, ok := sig.Metadata["is_near_threshold"]; !ok {
 		t.Error("expected is_near_threshold flag for 9600 with threshold 10000")
 	}
 
 	raw.Amount = 9000
-	sig = AnonymizeSignal(raw, "BNK", "salt", "pepper", 10000)
+	sig = AnonymizeSignal(raw, "BNK", "salt", "pepper", KeyingBank, 10000)
 	if _, ok := sig.Metadata["is_near_threshold"]; ok {
 		t.Error("should not flag 9000 as near threshold")
 	}
@@ -253,7 +377,7 @@ func TestAnonymizeSignal_NearThreshold(t *testing.T) {
 
 func TestAnonymizeSignal_MissingLocation(t *testing.T) {
 	raw := RawData{ID: "1", Name: "Test", Account: "ACC", Amount: 100, Timestamp: "2026-01-01T00:00:00Z"}
-	sig := AnonymizeSignal(raw, "BNK", "salt", "pepper", 10000)
+	sig := AnonymizeSignal(raw, "BNK", "salt", "pepper", KeyingBank, 10000)
 
 	if sig.Metadata["location_zone"] != "ZONE_UNKNOWN" {
 		t.Errorf("missing location should map to ZONE_UNKNOWN, got %v", sig.Metadata["location_zone"])
@@ -262,20 +386,23 @@ func TestAnonymizeSignal_MissingLocation(t *testing.T) {
 
 func TestAnonymizeSignal_DestinationMosaic(t *testing.T) {
 	raw := RawData{ID: "1", Name: "Test", Account: "ACC", Amount: 100, Timestamp: "2026-01-01T00:00:00Z", CounterpartyID: "CP123"}
-	sig := AnonymizeSignal(raw, "BNK", "salt", "pepper", 10000)
+	sig := AnonymizeSignal(raw, "BNK", "salt", "pepper", KeyingBank, 10000)
 
 	if sig.DestinationMosaic == "" {
 		t.Error("expected destination_mosaic when counterparty_id is set")
 	}
-	if sig.DestinationMosaicScope != ScopeLocal {
-		t.Errorf("counterparty_id without national ID should be local scope, got %s", sig.DestinationMosaicScope)
+	if sig.DestinationMosaicScope != ScopeBank {
+		t.Errorf("counterparty_id without national ID should be bank scope, got %s", sig.DestinationMosaicScope)
+	}
+	if sig.DestinationMosaicBasis != BasisInternalIDFallback {
+		t.Errorf("counterparty_id without national ID should be internal_id_fallback basis, got %s", sig.DestinationMosaicBasis)
 	}
 }
 
 func TestAnonymizeSignal_DeviceAndIPHash(t *testing.T) {
 	raw := RawData{ID: "1", Name: "Test", Account: "ACC", Amount: 100, Timestamp: "2026-01-01T00:00:00Z",
 		DeviceID: "device123", IP: "192.168.1.1"}
-	sig := AnonymizeSignal(raw, "BNK", "salt", "pepper", 10000)
+	sig := AnonymizeSignal(raw, "BNK", "salt", "pepper", KeyingBank, 10000)
 
 	if _, ok := sig.Metadata["device_id_hash"]; !ok {
 		t.Error("expected device_id_hash")
@@ -287,13 +414,45 @@ func TestAnonymizeSignal_DeviceAndIPHash(t *testing.T) {
 	// Pre-hashed should pass through
 	raw2 := RawData{ID: "1", Name: "Test", Account: "ACC", Amount: 100, Timestamp: "2026-01-01T00:00:00Z",
 		DeviceIDHash: "prehashed_device", IPHash: "prehashed_ip"}
-	sig2 := AnonymizeSignal(raw2, "BNK", "salt", "pepper", 10000)
+	sig2 := AnonymizeSignal(raw2, "BNK", "salt", "pepper", KeyingBank, 10000)
 
 	if sig2.Metadata["device_id_hash"] != "prehashed_device" {
 		t.Error("pre-hashed device_id_hash should pass through")
 	}
 	if sig2.Metadata["ip_hash"] != "prehashed_ip" {
 		t.Error("pre-hashed ip_hash should pass through")
+	}
+}
+
+func TestAnonymizeSignal_AccountDeviceIPHashUseVersionedHMAC(t *testing.T) {
+	// account_hash/device_id_hash/ip_hash must use HMACHash(salt, "v3|<field>|"+value)
+	// — a keyed MAC with an explicit versioned domain tag — not the older
+	// plain Hash(value+"|"+salt) concatenation-hash construction. Assert the
+	// exact formula so a regression back to the weaker construction (which
+	// would still produce SOME 64-char hex string and pass a shallow
+	// "is it hashed" check) is caught.
+	raw := RawData{ID: "1", Name: "Test", Account: "ACC-123", Amount: 100, Timestamp: "2026-01-01T00:00:00Z",
+		DeviceID: "device123", IP: "192.168.1.1"}
+	sig := AnonymizeSignal(raw, "BNK", "salt", "pepper", KeyingBank, 10000)
+
+	wantAccount := HMACHash("salt", "v3|account|ACC-123")
+	wantDevice := HMACHash("salt", "v3|device|device123")
+	wantIP := HMACHash("salt", "v3|ip|192.168.1.1")
+
+	if sig.Metadata["account_hash"] != wantAccount {
+		t.Errorf("account_hash = %v, want %v (HMACHash(salt, \"v3|account|\"+account))", sig.Metadata["account_hash"], wantAccount)
+	}
+	if sig.Metadata["device_id_hash"] != wantDevice {
+		t.Errorf("device_id_hash = %v, want %v (HMACHash(salt, \"v3|device|\"+device_id))", sig.Metadata["device_id_hash"], wantDevice)
+	}
+	if sig.Metadata["ip_hash"] != wantIP {
+		t.Errorf("ip_hash = %v, want %v (HMACHash(salt, \"v3|ip|\"+ip))", sig.Metadata["ip_hash"], wantIP)
+	}
+
+	// Sanity: must NOT match the old plain-concatenation SHA-256 construction.
+	oldAccount := Hash(raw.Account + "|" + "salt")
+	if sig.Metadata["account_hash"] == oldAccount {
+		t.Error("account_hash must not use the old Hash(value+\"|\"+salt) construction")
 	}
 }
 
@@ -403,7 +562,7 @@ func TestAnonymizeSignal_SignalIDUniqueAcrossCalls(t *testing.T) {
 	seen := make(map[string]bool)
 	const n = 200
 	for i := 0; i < n; i++ {
-		sig := AnonymizeSignal(raw, "BNK", "salt", "pepper", 10000)
+		sig := AnonymizeSignal(raw, "BNK", "salt", "pepper", KeyingBank, 10000)
 		if sig.SignalID == "" {
 			t.Fatal("expected a non-empty signal_id")
 		}
@@ -417,7 +576,7 @@ func TestAnonymizeSignal_SignalIDUniqueAcrossCalls(t *testing.T) {
 	// change the fact that every call still gets its own fresh signal_id
 	// (already covered above), and the identity mosaic (which IS derived
 	// from PII/config) must differ from the signal_id in shape/value.
-	sig := AnonymizeSignal(raw, "BNK", "salt", "pepper", 10000)
+	sig := AnonymizeSignal(raw, "BNK", "salt", "pepper", KeyingBank, 10000)
 	if sig.SignalID == sig.IdentityMosaic {
 		t.Error("signal_id must not equal identity_mosaic")
 	}
@@ -434,7 +593,7 @@ func TestAnonymizeSignal_SignalIDDerivedFromCallerRef(t *testing.T) {
 	raw := RawData{ID: "1", Name: "Test", Account: "ACC", Amount: 100, Timestamp: "2026-01-01T00:00:00Z",
 		TransactionRef: ref}
 
-	sig := AnonymizeSignal(raw, "BNK", "salt", "pepper", 10000)
+	sig := AnonymizeSignal(raw, "BNK", "salt", "pepper", KeyingBank, 10000)
 	if sig.SignalID == ref {
 		t.Fatalf("signal_id must never equal the raw transaction_ref, got %q", sig.SignalID)
 	}
@@ -445,14 +604,14 @@ func TestAnonymizeSignal_SignalIDDerivedFromCallerRef(t *testing.T) {
 	// Determinism: the same ref (and same salt) must derive the same
 	// signal_id every time, so it still works as an idempotency key / join
 	// key the bank can recompute.
-	sigAgain := AnonymizeSignal(raw, "BNK", "salt", "pepper", 10000)
+	sigAgain := AnonymizeSignal(raw, "BNK", "salt", "pepper", KeyingBank, 10000)
 	if sig.SignalID != sigAgain.SignalID {
 		t.Errorf("expected deterministic signal_id for the same ref, got %q and %q", sig.SignalID, sigAgain.SignalID)
 	}
 
 	// A different bank salt must change the derived signal_id — the vendor,
 	// without BANK_SALT, must not be able to invert or correlate it.
-	sigOtherSalt := AnonymizeSignal(raw, "BNK", "other_salt", "pepper", 10000)
+	sigOtherSalt := AnonymizeSignal(raw, "BNK", "other_salt", "pepper", KeyingBank, 10000)
 	if sigOtherSalt.SignalID == sig.SignalID {
 		t.Error("different bank salt must change the derived signal_id")
 	}
@@ -461,7 +620,7 @@ func TestAnonymizeSignal_SignalIDDerivedFromCallerRef(t *testing.T) {
 	// string fields' "must be usable, not just present" validation style.
 	rawBlank := raw
 	rawBlank.TransactionRef = "   "
-	sigBlank := AnonymizeSignal(rawBlank, "BNK", "salt", "pepper", 10000)
+	sigBlank := AnonymizeSignal(rawBlank, "BNK", "salt", "pepper", KeyingBank, 10000)
 	if sigBlank.SignalID == "" || sigBlank.SignalID == "   " {
 		t.Errorf("blank transaction_ref should fall back to a generated signal_id, got %q", sigBlank.SignalID)
 	}
@@ -470,8 +629,8 @@ func TestAnonymizeSignal_SignalIDDerivedFromCallerRef(t *testing.T) {
 	// with the derived signal_id above.
 	rawNoRef := raw
 	rawNoRef.TransactionRef = ""
-	sigA := AnonymizeSignal(rawNoRef, "BNK", "salt", "pepper", 10000)
-	sigB := AnonymizeSignal(rawNoRef, "BNK", "salt", "pepper", 10000)
+	sigA := AnonymizeSignal(rawNoRef, "BNK", "salt", "pepper", KeyingBank, 10000)
+	sigB := AnonymizeSignal(rawNoRef, "BNK", "salt", "pepper", KeyingBank, 10000)
 	if sigA.SignalID == sigB.SignalID {
 		t.Error("generated signal_id must differ across calls even with identical input")
 	}
@@ -509,7 +668,7 @@ func TestAnonymizeSignal_SignalIDDerivationHidesStructuredPII(t *testing.T) {
 				t.Fatalf("test setup error: %q was expected to match transactionRefPattern", tt.ref)
 			}
 
-			sig := AnonymizeSignal(raw, "BNK", "salt", "pepper", 10000)
+			sig := AnonymizeSignal(raw, "BNK", "salt", "pepper", KeyingBank, 10000)
 			if sig.SignalID == tt.ref {
 				t.Errorf("PII-shaped transaction_ref %q must be transformed, not passed through, got signal_id %q", tt.ref, sig.SignalID)
 			}
@@ -534,7 +693,7 @@ func TestAnonymizeSignal_SignalIDDerivationIsExactBytesNotNormalized(t *testing.
 	mkSig := func(ref string) AnonymizedSignal {
 		raw := RawData{ID: "1", Name: "Test", Account: "ACC", Amount: 100, Timestamp: "2026-01-01T00:00:00Z",
 			TransactionRef: ref}
-		return AnonymizeSignal(raw, "BNK", "salt", "pepper", 10000)
+		return AnonymizeSignal(raw, "BNK", "salt", "pepper", KeyingBank, 10000)
 	}
 
 	base := mkSig("TX001")
@@ -584,7 +743,7 @@ func TestNewSignalID(t *testing.T) {
 
 func TestAnonymizeSignal_FeatureVersionEmitted(t *testing.T) {
 	raw := RawData{ID: "1", Name: "Test", Account: "ACC", Amount: 100, Timestamp: "2026-01-01T00:00:00Z"}
-	sig := AnonymizeSignal(raw, "BNK", "salt", "pepper", 10000)
+	sig := AnonymizeSignal(raw, "BNK", "salt", "pepper", KeyingBank, 10000)
 
 	if sig.FeatureVersion != FeatureVersion {
 		t.Errorf("expected feature_version %d, got %d", FeatureVersion, sig.FeatureVersion)
@@ -708,7 +867,7 @@ func TestAnonymizeSignal_EmitsCanonicalSignalAndEndpointType(t *testing.T) {
 		t.Fatalf("unexpected validation error: %v", err)
 	}
 
-	sig := AnonymizeSignal(raw, "BNK", "salt", "pepper", 10000)
+	sig := AnonymizeSignal(raw, "BNK", "salt", "pepper", KeyingBank, 10000)
 	if sig.SignalType != "transaction" {
 		t.Errorf("expected canonical signal_type %q, got %q", "transaction", sig.SignalType)
 	}

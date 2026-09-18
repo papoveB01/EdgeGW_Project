@@ -265,7 +265,10 @@ func main() {
 				HasPending:       hasPending,
 			}
 		})
-		slog.Info("Durable spool enabled", "dir", spoolDir, "max_depth", maxDepth, "pending", sp.Depth())
+		slog.Info("Durable spool enabled", "dir", spoolDir, "max_depth", maxDepth, "pending", sp.Depth(), "fsync", sp.FsyncEnabled())
+		if !sp.FsyncEnabled() {
+			slog.Warn("SPOOL_FSYNC=false - a 202 Accepted no longer implies a signal survives host power loss, only a process crash; see README's Durable spool section")
+		}
 	} else if cfg.IsStandalone() {
 		slog.Warn("SPOOL_DIR not set - writing to the local sink synchronously; a slow/unwritable disk blocks /process")
 	} else {

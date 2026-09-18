@@ -51,6 +51,7 @@ new mosaic scopes.
 | `mosaic_version` | absent | **new, always present**: `2` |
 | `signal_id` | absent | **new, always present**: unique per event, see below |
 | `feature_version` | absent | **new, always present**: see below |
+| `signal_type` / `endpoint_type` | free-form, unvalidated | **BREAKING**: closed allowlist, case-insensitive match, canonical spelling emitted — see below |
 | `destination_mosaic_scope` | absent | new, present iff `destination_mosaic` is |
 | Timestamp | bucketed, timezone lost | RFC 3339, normalized to UTC, 15-min bucket |
 | `location_zone` | always a geohash (0,0 fabricated when unknown) | geohash-5 or `ZONE_UNKNOWN` |
@@ -79,6 +80,40 @@ trusting new signals — these boundaries can change independently of
 v1 and v2 mosaics never collide meaningfully — the derivations differ — so
 during migration the Hub should partition matching by `mosaic_version`
 (treat absent as version 1).
+
+## `signal_type` / `endpoint_type` — closed allowlists (BREAKING CHANGE)
+
+**Breaking change:** the gateway now hard-rejects inbound requests whose
+`signal_type` or `endpoint_type` is not on a fixed allowlist, returning
+`400` from `/process` instead of accepting the signal. A core banking system
+sending a value outside these lists — including a value the gateway
+previously forwarded unquestioned — will start seeing `400`s from this
+release onward. This exists to keep the pipeline scoped to fraud-relevant
+signals rather than silently widening into general behavioural egress to a
+commercial vendor; it is enforced in `RawData.Validate()`.
+
+- **`signal_type` allowlist** (canonical spelling is lowercase):
+  `transaction`, `login`, `transfer`, `authentication`.
+- **`endpoint_type` allowlist** (canonical spelling is uppercase):
+  `MOBILE_APP`, `ATM`, `POS`, `WEB`, `BRANCH`, `API`, `USSD`, `IVR`.
+  `USSD` and `IVR` were added specifically for this deployment's market —
+  USSD banking and IVR/call-centre channels are common where BVN/NIN
+  identifiers apply — rather than carried over from prior repo usage.
+- **Matching is case-insensitive.** `"Transaction"`, `"transaction"`, and
+  `"TRANSACTION"` are all accepted as the same value; likewise
+  `"mobile_app"` and `"MOBILE_APP"`.
+- **The emitted value is normalized to canonical spelling**, not passed
+  through as typed. Whatever casing the caller sends, the outgoing signal's
+  `signal_type` and `metadata.endpoint_type` always use the allowlist's own
+  spelling (lowercase for `signal_type`, uppercase for `endpoint_type`), so
+  the vendor sees one consistent spelling regardless of caller casing.
+- An empty `signal_type` is still accepted and defaults to `"transaction"`,
+  unchanged from prior behavior. `endpoint_type` remains optional; when
+  absent, `metadata.endpoint_type` is simply omitted.
+
+Both allowlists are package-level (`processor.ValidSignalTypes`,
+`processor.ValidEndpointTypes`) and intended to be extended deliberately as
+new legitimate values are identified.
 
 ## Mosaic derivation (gateway-side, for reference)
 

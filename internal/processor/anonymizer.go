@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"math"
+	"regexp"
 	"strings"
 	"time"
 	"unicode"
@@ -58,6 +59,10 @@ const (
 // SignalType. It exists so the pipeline stays scoped to fraud-relevant
 // events rather than silently widening into general behavioural egress to
 // a commercial vendor. Package-level so it's easy to extend deliberately.
+// Keys are the canonical (lowercase) spelling: RawData.Validate matches
+// case-insensitively and rewrites SignalType to the matching key here, so
+// every signal reaching the vendor uses one consistent spelling regardless
+// of how the caller cased it.
 var ValidSignalTypes = map[string]bool{
 	"transaction":    true,
 	"login":          true,
@@ -67,6 +72,16 @@ var ValidSignalTypes = map[string]bool{
 
 // ValidEndpointTypes is the closed allowlist enforced by RawData.Validate
 // for EndpointType. Package-level so it's easy to extend deliberately.
+// Keys are the canonical (uppercase) spelling — see ValidSignalTypes for
+// the matching/normalization behavior, mirrored here in uppercase.
+//
+// USSD and IVR are included alongside the original MOBILE_APP/ATM/POS/WEB/
+// BRANCH/API set: this repo targets the Nigerian market (BVN/NIN
+// identifiers, Lagos coordinates in examples), where USSD banking is a
+// major channel and IVR/call-centre transactions are common — hard-
+// rejecting them would drop real traffic. Flagged as a judgment call made
+// alongside the hard-reject decision, not something the repo already used
+// elsewhere.
 var ValidEndpointTypes = map[string]bool{
 	"MOBILE_APP": true,
 	"ATM":        true,
@@ -74,7 +89,19 @@ var ValidEndpointTypes = map[string]bool{
 	"WEB":        true,
 	"BRANCH":     true,
 	"API":        true,
+	"USSD":       true,
+	"IVR":        true,
 }
+
+// transactionRefPattern is the opaque-reference shape RawData.Validate
+// enforces for TransactionRef. TransactionRef becomes AnonymizedSignal's
+// SignalID verbatim and is sent to an external commercial vendor, so it
+// must never be able to smuggle PII (a name, account number, national ID)
+// past every other redaction in this package. Restricting it to a short,
+// alnum/underscore/hyphen token — the shape of a typical opaque core
+// banking reference/UUID — keeps that boundary enforced rather than
+// documented-only.
+var transactionRefPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
 
 // RawData represents incoming transaction data with PII and optional fraud-detection fields.
 // Latitude/Longitude are optional (card-not-present and online transactions often
@@ -132,13 +159,33 @@ func (r *RawData) Validate() error {
 			return &ValidationError{Field: "longitude", Message: "must be between -180 and 180"}
 		}
 	}
-	// Empty signal_type is allowed here — it defaults to "transaction" in
-	// AnonymizeSignal. A non-empty value must be on the allowlist.
-	if r.SignalType != "" && !ValidSignalTypes[r.SignalType] {
-		return &ValidationError{Field: "signal_type", Message: fmt.Sprintf("unknown signal_type %q", r.SignalType)}
+	// Whitespace-only transaction_ref is treated the same as absent (it's
+	// what AnonymizeSignal falls back on for signal_id generation too); a
+	// non-blank value must be an opaque token, never free text that could
+	// carry PII.
+	if ref := strings.TrimSpace(r.TransactionRef); ref != "" && !transactionRefPattern.MatchString(ref) {
+		return &ValidationError{Field: "transaction_ref", Message: "must be an opaque reference matching ^[A-Za-z0-9_-]{1,64}$ (no spaces or punctuation; must not contain names or identifiers)"}
 	}
-	if r.EndpointType != "" && !ValidEndpointTypes[r.EndpointType] {
-		return &ValidationError{Field: "endpoint_type", Message: fmt.Sprintf("unknown endpoint_type %q", r.EndpointType)}
+	// Empty signal_type is allowed here — it defaults to "transaction" in
+	// AnonymizeSignal. A non-empty value must be on the allowlist, matched
+	// case-insensitively; on success r.SignalType is rewritten to the
+	// allowlist's canonical (lowercase) spelling so every signal reaching
+	// the vendor is consistent regardless of caller casing.
+	if r.SignalType != "" {
+		canonical := strings.ToLower(r.SignalType)
+		if !ValidSignalTypes[canonical] {
+			return &ValidationError{Field: "signal_type", Message: fmt.Sprintf("unknown signal_type %q", r.SignalType)}
+		}
+		r.SignalType = canonical
+	}
+	// Same case-insensitive match + canonical (uppercase) rewrite for
+	// endpoint_type.
+	if r.EndpointType != "" {
+		canonical := strings.ToUpper(r.EndpointType)
+		if !ValidEndpointTypes[canonical] {
+			return &ValidationError{Field: "endpoint_type", Message: fmt.Sprintf("unknown endpoint_type %q", r.EndpointType)}
+		}
+		r.EndpointType = canonical
 	}
 	return nil
 }
@@ -294,12 +341,30 @@ func BucketTimestamp(ts string) string {
 // NewSignalID generates a random per-event identifier in UUIDv4 form using
 // crypto/rand. It carries no information about the underlying transaction
 // or person — it is pure randomness, never derived from PII.
+//
+// On rand.Read failure this panics rather than returning an error. That is
+// a deliberate, scoped tradeoff, not an oversight:
+//   - rand.Read only fails when the OS's CSPRNG itself is broken (see the
+//     crypto/rand docs) — a condition under which continuing to serve any
+//     request is already unsound, not just this one field.
+//   - Threading a real error out of here would change AnonymizeSignal's
+//     signature (today a pure `(RawData, ...) AnonymizedSignal` function,
+//     by design per this repo's architecture notes) and every caller,
+//     including cmd/gateway/main.go's processTransaction — which is
+//     explicitly out of scope for this change beyond echoing signal_id in
+//     the response body.
+//
+// Known gap this leaves: net/http recovers panics per-connection with no
+// structured log or metric, so unlike every other failure path in
+// processTransaction (slog.Error + a proper http.Error status), a
+// rand.Read failure currently surfaces to the caller as a bare connection
+// reset. If this entropy-failure mode matters for this deployment's threat
+// model, the fix is to make AnonymizeSignal return an error and update
+// processTransaction (and its tests) to log and respond 500 — tracked as
+// follow-up work rather than folded into this change.
 func NewSignalID() string {
 	var b [16]byte
 	if _, err := rand.Read(b[:]); err != nil {
-		// crypto/rand failing indicates the OS entropy source is broken —
-		// there is no safe fallback that preserves the "not derived from
-		// PII, globally unique" guarantee, so fail loudly.
 		panic("processor: failed to read random bytes for signal_id: " + err.Error())
 	}
 	b[6] = (b[6] & 0x0f) | 0x40 // version 4

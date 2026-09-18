@@ -2,6 +2,7 @@ package processor
 
 import (
 	"math"
+	"strings"
 	"testing"
 )
 
@@ -310,7 +311,10 @@ func TestValidate_SignalTypeAllowlist(t *testing.T) {
 		{"known: transfer", "transfer", false},
 		{"known: authentication", "authentication", false},
 		{"unknown value rejected", "general_behaviour", true},
-		{"case mismatch rejected", "Transaction", true},
+		// Matching is case-insensitive (see TestValidate_SignalTypeCaseInsensitiveNormalization
+		// for the normalization assertion) — mixed case of a KNOWN value is accepted.
+		{"mixed case of known value accepted", "Transaction", false},
+		{"unknown value still rejected regardless of case", "General_Behaviour", true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -351,8 +355,13 @@ func TestValidate_EndpointTypeAllowlist(t *testing.T) {
 		{"known: WEB", "WEB", false},
 		{"known: BRANCH", "BRANCH", false},
 		{"known: API", "API", false},
+		{"known: USSD", "USSD", false},
+		{"known: IVR", "IVR", false},
 		{"unknown value rejected", "SMART_FRIDGE", true},
-		{"case mismatch rejected", "mobile_app", true},
+		// Matching is case-insensitive (see TestValidate_EndpointTypeCaseInsensitiveNormalization
+		// for the normalization assertion) — mixed case of a KNOWN value is accepted.
+		{"mixed case of known value accepted", "mobile_app", false},
+		{"unknown value still rejected regardless of case", "smart_fridge", true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -473,5 +482,128 @@ func TestAnonymizeSignal_FeatureVersionEmitted(t *testing.T) {
 	}
 	if sig.FeatureVersion == 0 {
 		t.Error("feature_version must be a positive, explicit version, not the zero value")
+	}
+}
+
+func TestValidate_TransactionRefShape(t *testing.T) {
+	base := RawData{ID: "1", Name: "Test", Account: "ACC", Amount: 100, Timestamp: "2026-01-15T14:07:33Z"}
+
+	tests := []struct {
+		name    string
+		ref     string
+		wantErr bool
+	}{
+		{"absent is allowed", "", false},
+		{"whitespace-only treated as absent", "   ", false},
+		{"valid opaque ref", "core-banking-ref-88421", false},
+		{"valid uuid-shaped ref", "3fa85f64-5717-4562-b3fc-2c963f66afa6", false},
+		{"valid with underscore", "TXN_2026_08421", false},
+		{"over-long ref rejected", strings.Repeat("a", 65), true},
+		{"max-length ref allowed", strings.Repeat("a", 64), false},
+		{"ref with internal spaces rejected", "core banking ref", true},
+		{"ref with punctuation rejected", "ref#88421!", true},
+		{"ref with a dot rejected", "txn.88421", true},
+		{"name-like ref rejected", "Ngozi Adeyemi", true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r := base
+			r.TransactionRef = tt.ref
+			err := r.Validate()
+			if tt.wantErr && err == nil {
+				t.Errorf("transaction_ref %q: expected validation error, got nil", tt.ref)
+			}
+			if !tt.wantErr && err != nil {
+				t.Errorf("transaction_ref %q: unexpected validation error: %v", tt.ref, err)
+			}
+			if tt.wantErr {
+				ve, ok := err.(*ValidationError)
+				if !ok {
+					t.Fatalf("transaction_ref %q: expected *ValidationError, got %T", tt.ref, err)
+				}
+				if ve.Field != "transaction_ref" {
+					t.Errorf("transaction_ref %q: expected error field %q, got %q", tt.ref, "transaction_ref", ve.Field)
+				}
+			}
+		})
+	}
+}
+
+func TestValidate_SignalTypeCaseInsensitiveNormalization(t *testing.T) {
+	base := RawData{ID: "1", Name: "Test", Account: "ACC", Amount: 100, Timestamp: "2026-01-15T14:07:33Z"}
+
+	tests := []struct {
+		input string
+		want  string
+	}{
+		{"transaction", "transaction"},
+		{"Transaction", "transaction"},
+		{"TRANSACTION", "transaction"},
+		{"LoGiN", "login"},
+		{"TRANSFER", "transfer"},
+		{"Authentication", "authentication"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.input, func(t *testing.T) {
+			r := base
+			r.SignalType = tt.input
+			if err := r.Validate(); err != nil {
+				t.Fatalf("signal_type %q: unexpected validation error: %v", tt.input, err)
+			}
+			if r.SignalType != tt.want {
+				t.Errorf("signal_type %q: expected Validate to normalize to %q, got %q", tt.input, tt.want, r.SignalType)
+			}
+		})
+	}
+}
+
+func TestValidate_EndpointTypeCaseInsensitiveNormalization(t *testing.T) {
+	base := RawData{ID: "1", Name: "Test", Account: "ACC", Amount: 100, Timestamp: "2026-01-15T14:07:33Z"}
+
+	tests := []struct {
+		input string
+		want  string
+	}{
+		{"MOBILE_APP", "MOBILE_APP"},
+		{"mobile_app", "MOBILE_APP"},
+		{"Mobile_App", "MOBILE_APP"},
+		{"ussd", "USSD"},
+		{"USSD", "USSD"},
+		{"ivr", "IVR"},
+		{"Ivr", "IVR"},
+		{"atm", "ATM"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.input, func(t *testing.T) {
+			r := base
+			r.EndpointType = tt.input
+			if err := r.Validate(); err != nil {
+				t.Fatalf("endpoint_type %q: unexpected validation error: %v", tt.input, err)
+			}
+			if r.EndpointType != tt.want {
+				t.Errorf("endpoint_type %q: expected Validate to normalize to %q, got %q", tt.input, tt.want, r.EndpointType)
+			}
+		})
+	}
+}
+
+func TestAnonymizeSignal_EmitsCanonicalSignalAndEndpointType(t *testing.T) {
+	// End-to-end: Validate (as adapters.ProcessInboundRequest calls it) then
+	// AnonymizeSignal must emit the canonical spelling regardless of how the
+	// caller cased signal_type/endpoint_type, so the vendor always sees one
+	// consistent spelling.
+	raw := RawData{ID: "1", Name: "Test", Account: "ACC", Amount: 100, Timestamp: "2026-01-01T00:00:00Z",
+		SignalType: "TrAnSaCtIoN", EndpointType: "ussd"}
+
+	if err := raw.Validate(); err != nil {
+		t.Fatalf("unexpected validation error: %v", err)
+	}
+
+	sig := AnonymizeSignal(raw, "BNK", "salt", "pepper", 10000)
+	if sig.SignalType != "transaction" {
+		t.Errorf("expected canonical signal_type %q, got %q", "transaction", sig.SignalType)
+	}
+	if sig.Metadata["endpoint_type"] != "USSD" {
+		t.Errorf("expected canonical endpoint_type %q, got %v", "USSD", sig.Metadata["endpoint_type"])
 	}
 }

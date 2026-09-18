@@ -12,30 +12,39 @@ services:
       # middleware (default): one-way egress to an external vendor fraud
       #   platform. Requires the vendor params below.
       # standalone: no external system; signals go to the local sink
-      #   instead. If you run standalone, none of the vendor params below
-      #   are read, but compose still requires them to be *set* (even to
-      #   an empty string, e.g. `API_KEY=` in your .env) because "not set
-      #   at all" is treated the same as a forgotten credential. That's a
-      #   compose-level limitation, not an app one: the app itself never
-      #   demands vendor credentials in standalone mode (see main.go's
-      #   validateStartup).
+      #   instead. None of the vendor params below are read in this mode.
+      #   To run standalone with this file, set GATEWAY_MODE=standalone
+      #   AND set each vendor var below to an explicit empty value in your
+      #   .env, e.g. `API_KEY=` (present, but blank) - NOT simply omitted.
+      #   This matters because of how `${VAR?...}` (below) differs from
+      #   `${VAR:?...}`: verified against `docker compose config` output,
+      #   the colon form (:?) errors on both "unset" and "set but empty",
+      #   while the no-colon form (?) errors only on "unset" and happily
+      #   passes an explicit empty string through. Using the no-colon form
+      #   for the vendor vars is what makes standalone actually work from
+      #   this same file: forgetting a var still fails `docker compose up`
+      #   with a clear error before any container starts (avoiding a
+      #   crash-loop under `restart: always`), while deliberately blanking
+      #   a var for standalone is respected. The app itself never demands
+      #   vendor credentials in standalone mode either way (see main.go's
+      #   validateStartup) - this is purely about compose getting out of
+      #   its way.
       - GATEWAY_MODE=${GATEWAY_MODE:-middleware}
 
       # ─── Vendor platform params (required in middleware mode) ──────
-      # All four use ${VAR:?...}, which fails `docker compose up` with a
-      # clear one-line error *before* any container starts, instead of
-      # starting the container and letting it crash-loop under
-      # `restart: always`. This must stay consistent across all four -
-      # a required var using ${VAR:-default-or-empty} silently defeats
-      # that fail-fast behavior for exactly this reason.
+      # All four use ${VAR?...} (no colon - see comment above): fails
+      # `docker compose up` with a clear one-line error if forgotten
+      # entirely, but allows an explicit empty value for standalone mode.
       - INSTITUTION_ID=${INSTITUTION_ID:?Set INSTITUTION_ID}
-      - API_KEY=${API_KEY:?Set API_KEY (required in middleware mode)}
-      - HMAC_SECRET=${HMAC_SECRET:?Set HMAC_SECRET (required in middleware mode)}
-      - HUB_API_URL=${HUB_API_URL:?Set HUB_API_URL (required in middleware mode; no placeholder default is used)}
+      - API_KEY=${API_KEY?Set API_KEY (required in middleware mode; set to an explicit empty value for standalone, e.g. API_KEY= in .env)}
+      - HMAC_SECRET=${HMAC_SECRET?Set HMAC_SECRET (required in middleware mode; set to an explicit empty value for standalone, e.g. HMAC_SECRET= in .env)}
+      - HUB_API_URL=${HUB_API_URL?Set HUB_API_URL (required in middleware mode, no placeholder default is used; set to an explicit empty value for standalone, e.g. HUB_API_URL= in .env)}
 
       # ─── Local params (managed by the bank, never sent externally) ─
+      # INSTITUTION_ID/BANK_SALT are always required (both modes), so they
+      # keep ${VAR:?...} - an empty value is never acceptable for them.
       - BANK_SALT=${BANK_SALT:?Set BANK_SALT (min 32 chars)}
-      - REGIONAL_PEPPER=${REGIONAL_PEPPER:?Set REGIONAL_PEPPER (required in middleware mode; not needed if GATEWAY_MODE=standalone)}
+      - REGIONAL_PEPPER=${REGIONAL_PEPPER?Set REGIONAL_PEPPER (required in middleware mode; set to an explicit empty value for standalone, e.g. REGIONAL_PEPPER= in .env)}
 
       # ─── Standalone mode only (ignored in middleware mode) ─────────
       - STANDALONE_SINK_DIR=${STANDALONE_SINK_DIR:-/sink}

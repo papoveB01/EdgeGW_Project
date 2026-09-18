@@ -104,6 +104,64 @@ func TestValidateStartup_MiddlewareFullyConfiguredStartsClean(t *testing.T) {
 	}
 }
 
+func TestResolvePepper_StandaloneWithoutRegionalPepperDerivesFromBankSalt(t *testing.T) {
+	t.Setenv("REGIONAL_PEPPER", "")
+
+	bankSalt := "a_sufficiently_long_bank_salt_value"
+	cfg := &config.GatewayConfig{
+		Mode:  config.ModeStandalone,
+		Local: config.LocalParams{BankSalt: bankSalt},
+	}
+
+	pepper, derived := resolvePepper(cfg)
+
+	if !derived {
+		t.Fatal("expected resolvePepper to report the pepper as derived")
+	}
+	if pepper == "" {
+		t.Fatal("standalone mode must never derive an empty pepper - HMAC with an empty key is a publicly computable function")
+	}
+	if pepper == bankSalt {
+		t.Fatal("derived pepper must not equal BANK_SALT verbatim (must be a distinct derivation, not a passthrough)")
+	}
+}
+
+func TestResolvePepper_StandaloneWithExplicitRegionalPepperUsesItAsIs(t *testing.T) {
+	t.Setenv("REGIONAL_PEPPER", "an_explicit_pepper")
+
+	cfg := &config.GatewayConfig{
+		Mode:  config.ModeStandalone,
+		Local: config.LocalParams{BankSalt: "a_sufficiently_long_bank_salt_value"},
+	}
+
+	pepper, derived := resolvePepper(cfg)
+
+	if derived {
+		t.Fatal("expected resolvePepper to use the explicit REGIONAL_PEPPER, not derive one")
+	}
+	if pepper != "an_explicit_pepper" {
+		t.Fatalf("expected explicit pepper to pass through unchanged, got %q", pepper)
+	}
+}
+
+func TestResolvePepper_MiddlewareUsesRegionalPepperAsIs(t *testing.T) {
+	t.Setenv("REGIONAL_PEPPER", "the_shared_pepper")
+
+	cfg := &config.GatewayConfig{
+		Mode:  config.ModeMiddleware,
+		Local: config.LocalParams{BankSalt: "a_sufficiently_long_bank_salt_value"},
+	}
+
+	pepper, derived := resolvePepper(cfg)
+
+	if derived {
+		t.Fatal("middleware mode must never derive a pepper")
+	}
+	if pepper != "the_shared_pepper" {
+		t.Fatalf("expected REGIONAL_PEPPER value unchanged, got %q", pepper)
+	}
+}
+
 func TestValidateStartup_UnknownModeRejected(t *testing.T) {
 	cfg := &config.GatewayConfig{
 		Mode: "bogus",

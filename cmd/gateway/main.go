@@ -55,6 +55,13 @@ func main() {
 		slog.Warn("INBOUND_API_KEY not set - /process accepts unauthenticated requests; set it in production")
 	}
 
+	// Pepper for global-scope mosaic derivation - see resolvePepper. Never
+	// the empty string, even in standalone mode.
+	pepper, pepperIsDerived := resolvePepper(cfg)
+	if pepperIsDerived {
+		slog.Info("Standalone mode: REGIONAL_PEPPER not set, deriving a local pepper from BANK_SALT - mosaics are bank-local only and not comparable to any mosaic derived with a real REGIONAL_PEPPER")
+	}
+
 	// Delivery destination: middleware forwards one-way to the external
 	// vendor platform; standalone has no external system, so signals are
 	// written to a local durable sink instead. Either way, "forward now"
@@ -77,6 +84,13 @@ func main() {
 			os.Exit(1)
 		}
 		deliver = sink.Forward
+		// No bounded-retry wrapper here, unlike middleware's
+		// ForwardToHubWithRetry: middleware retries because a network call to
+		// a remote vendor can fail transiently; a local disk write either
+		// succeeds or fails for a reason (permissions, full disk) that a few
+		// immediate retries won't fix. A failure here still returns 502 to
+		// the caller, and SPOOL_DIR remains the right way to ride out a
+		// sink outage rather than retrying synchronously in the request path.
 		syncForward = func(ctx context.Context, signal processor.AnonymizedSignal) error {
 			payload, err := json.Marshal(signal)
 			if err != nil {
@@ -127,7 +141,7 @@ func main() {
 
 	mux.HandleFunc("/health", adapters.HealthCheckHandler)
 	mux.HandleFunc("/metrics", adapters.MetricsHandler)
-	mux.Handle("/process", middleware.RequireAPIKey(processTransaction(sp, syncForward), inboundKey))
+	mux.Handle("/process", middleware.RequireAPIKey(processTransaction(sp, syncForward, pepper), inboundKey))
 
 	// Wrap with request logging and body size limit middleware
 	handler := middleware.RequestLogger(middleware.MaxBodySize(mux, 1<<20)) // 1MB limit
@@ -243,6 +257,40 @@ func validateStartup(cfg *config.GatewayConfig) []string {
 	return problems
 }
 
+// standalonePepperDomain is a fixed domain-separation string for the
+// deployment-local pepper standalone mode derives from BANK_SALT. It has no
+// secrecy value itself - BANK_SALT is what must stay secret - it just keeps
+// this derivation distinguishable from any other use of BANK_SALT.
+const standalonePepperDomain = "standalone-pepper-v1"
+
+// resolvePepper returns the key used for global-scope mosaic derivation, and
+// whether it was derived (rather than taken from REGIONAL_PEPPER directly).
+//
+// In middleware mode this is always the shared REGIONAL_PEPPER
+// (validateStartup already guarantees it's non-empty there). In standalone
+// mode REGIONAL_PEPPER isn't required and is typically unset - but the
+// derivation must never run with an empty key: HMAC-SHA256("", msg) is a
+// publicly computable function with no secret in it, and a national ID
+// (BVN/NIN) is only an 11-digit space, so every global-scope mosaic written
+// to the sink would be trivially reversible offline by anyone who can read
+// those files. Standalone mode's whole premise is that data stays inside the
+// bank, so that would be a silent, serious weakening of the pseudonymization
+// the gateway advertises. So when REGIONAL_PEPPER is unset in standalone
+// mode, derive a deployment-local pepper from BANK_SALT instead - never hand
+// the derivation an empty key. BANK_SALT's secrecy is then what protects the
+// local sink data; see README's Configuration section. If an operator sets
+// REGIONAL_PEPPER explicitly even in standalone mode, that value is used
+// as-is.
+func resolvePepper(cfg *config.GatewayConfig) (pepper string, derived bool) {
+	if p := os.Getenv("REGIONAL_PEPPER"); p != "" {
+		return p, false
+	}
+	if cfg.IsStandalone() {
+		return processor.HMACHash(cfg.Local.BankSalt, standalonePepperDomain), true
+	}
+	return "", false
+}
+
 // healthcheck probes the local /health endpoint and returns a process exit code.
 func healthcheck() int {
 	port := os.Getenv("GATEWAY_PORT")
@@ -272,8 +320,10 @@ func healthcheck() int {
 // With a spool: persist and return 202 Accepted (delivery is asynchronous).
 // Without: deliver synchronously via syncForward and return 200/502.
 // syncForward is mode-dependent: middleware forwards to the vendor platform
-// with bounded retry, standalone writes to the local sink.
-func processTransaction(sp *spool.Spool, syncForward func(ctx context.Context, signal processor.AnonymizedSignal) error) http.HandlerFunc {
+// with bounded retry, standalone writes to the local sink. pepper is the key
+// for global-scope mosaic derivation, resolved once at startup (see main) -
+// never the empty string, even in standalone mode.
+func processTransaction(sp *spool.Spool, syncForward func(ctx context.Context, signal processor.AnonymizedSignal) error, pepper string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		startTime := time.Now()
 
@@ -292,7 +342,6 @@ func processTransaction(sp *spool.Spool, syncForward func(ctx context.Context, s
 
 		cfg := config.Get()
 		salt := cfg.Local.BankSalt
-		pepper := os.Getenv("REGIONAL_PEPPER")
 
 		anonymized := processor.AnonymizeSignal(*rawData, cfg.Hub.InstitutionID, salt, pepper, cfg.Local.ReportingThreshold)
 

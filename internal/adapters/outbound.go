@@ -53,14 +53,20 @@ func ForwardToHub(ctx context.Context, signal interface{}) error {
 }
 
 // ForwardPayload sends a pre-marshaled signal payload to the Hub. Single attempt.
+//
+// No placeholder/fallback destination: config.Get already applies HUB_API_URL
+// on top of the config file (env overrides file), so re-reading the env var
+// here would be redundant, and a hardcoded host would silently resurrect the
+// exact bug class this package's caller (main.go's validateStartup) exists to
+// eliminate - a gateway with no real destination posting to a fake one
+// instead of failing loudly. If nothing configured a destination, that is a
+// caller bug (this mode should never have gotten this far), so it is a
+// permanent, non-retryable error rather than a fallback URL.
 func ForwardPayload(ctx context.Context, payload []byte) error {
 	cfg := config.Get()
 	hubURL := cfg.Hub.HubEndpointURL
 	if hubURL == "" {
-		hubURL = os.Getenv("HUB_API_URL")
-	}
-	if hubURL == "" {
-		hubURL = "http://intel-api:8000/api/v1/signals"
+		return &permanentError{fmt.Errorf("no Hub/vendor destination configured (hub.hub_endpoint_url / HUB_API_URL not set)")}
 	}
 
 	apiKey := cfg.Hub.APIKey

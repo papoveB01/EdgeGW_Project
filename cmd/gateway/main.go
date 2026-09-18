@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/papoveB01/EdgeGW_Project/internal/adapters"
+	"github.com/papoveB01/EdgeGW_Project/internal/auditlog"
 	"github.com/papoveB01/EdgeGW_Project/internal/config"
 	"github.com/papoveB01/EdgeGW_Project/internal/middleware"
 	"github.com/papoveB01/EdgeGW_Project/internal/processor"
@@ -80,6 +81,11 @@ func main() {
 	syncForward := func(ctx context.Context, signal processor.AnonymizedSignal) error {
 		return adapters.ForwardToHubWithRetry(ctx, signal, 2)
 	}
+	// destination identifies, for the audit trail below, where signals
+	// actually go: the vendor URL in middleware mode, or the standalone
+	// sink's directory. Resolved once here (same place deliver/syncForward
+	// are resolved) rather than re-read per record.
+	destination := cfg.Hub.HubEndpointURL
 	if cfg.IsStandalone() {
 		sinkDir := os.Getenv("STANDALONE_SINK_DIR")
 		if sinkDir == "" {
@@ -91,6 +97,7 @@ func main() {
 			slog.Error("Failed to open standalone sink", "dir", sinkDir, "error", err)
 			os.Exit(1)
 		}
+		destination = "local-sink:" + sinkDir
 		deliver = sink.Forward
 		// No bounded-retry wrapper here, unlike middleware's
 		// ForwardToHubWithRetry: middleware retries because a network call to
@@ -107,6 +114,36 @@ func main() {
 			return sink.Forward(ctx, payload)
 		}
 		slog.Info("Standalone mode: signals are written locally, not forwarded anywhere", "sink_dir", sinkDir)
+	}
+
+	// Durable egress audit log: a record written ONLY after a destination
+	// confirms delivery, surviving both process restarts and spool deletion
+	// (internal/spool removes a signal's file the instant delivery
+	// succeeds, so it is never evidence of what left the bank - see
+	// internal/auditlog's package doc). Without this, nothing durable
+	// answers "show me everything you sent this vendor last quarter".
+	//
+	// Default is disabled with a loud startup warning, mirroring SPOOL_DIR:
+	// audit records are compliance infrastructure that changes what a
+	// regulator can be shown, not a default-on convenience, and an operator
+	// who hasn't provisioned a directory (and its retention policy - this
+	// package never rotates or expires records, same as the standalone
+	// sink) for permanent personal-data records shouldn't get one silently
+	// created under their working directory.
+	var auditLogger *auditlog.Logger
+	if auditDir := os.Getenv("EGRESS_AUDIT_DIR"); auditDir != "" {
+		storePayload := os.Getenv("EGRESS_AUDIT_STORE_PAYLOAD") == "true"
+		var err error
+		auditLogger, err = auditlog.New(auditDir, storePayload)
+		if err != nil {
+			slog.Error("Failed to open egress audit log", "dir", auditDir, "error", err)
+			os.Exit(1)
+		}
+		deliver = auditingForward(deliver, auditLogger, destination)
+		syncForward = auditingSyncForward(syncForward, auditLogger, destination)
+		slog.Info("Egress audit log enabled", "dir", auditDir, "store_full_payload", storePayload, "destination", destination)
+	} else {
+		slog.Warn("EGRESS_AUDIT_DIR not set - confirmed deliveries are not durably recorded; an auditor cannot be shown what left the bank")
 	}
 
 	// Readiness thresholds: egress is one-way (no score ever comes back
@@ -257,6 +294,11 @@ func main() {
 	if sink != nil {
 		if err := sink.Close(); err != nil {
 			slog.Warn("Failed to close standalone sink cleanly", "error", err)
+		}
+	}
+	if auditLogger != nil {
+		if err := auditLogger.Close(); err != nil {
+			slog.Warn("Failed to close egress audit log cleanly", "error", err)
 		}
 	}
 	slog.Info("Server stopped")

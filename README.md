@@ -157,6 +157,42 @@ enumerable offline). This replaces the old standalone-only
 "derive-a-local-pepper-from-BANK_SALT" behavior, which existed only because
 v2's global mosaic had no bank-salt fallback to begin with.
 
+### Egress audit log
+
+Neither the spool nor `/metrics` can answer "show me everything you sent
+this vendor last quarter": the spool deletes a signal's file the instant
+delivery succeeds (its on-disk state is evidence of what hasn't been
+delivered yet, never of what was), and `/metrics` counters are in-memory,
+reset on restart, and carry no per-signal identity.
+
+Set `EGRESS_AUDIT_DIR` to enable a separate, durable, append-only record of
+every CONFIRMED delivery (vendor-accepted in middleware mode, durably
+written to the local sink in standalone mode) — never of an attempt or an
+enqueue. Records are newline-delimited JSON, one file per UTC day (same
+convention as the standalone sink), fsynced before being reported as
+written, and contain the delivery timestamp, the destination, `signal_id`,
+`mosaic_version`, `feature_version`, `mosaic_scope`, and a SHA-256 digest of
+the exact delivered payload bytes — proof of what was sent without
+necessarily keeping a second copy of it. The full payload is stored only if
+`EGRESS_AUDIT_STORE_PAYLOAD=true` is set explicitly; the default is
+digest-only, because the payload is pseudonymized but still personal data,
+and a second copy is a second liability. Audit files are written `0o600`
+under a `0o700` directory.
+
+If the audit write fails immediately after the destination has already
+accepted a signal, the gateway reports failure rather than success — the
+spool retries the signal (in synchronous mode, whatever calls `/process`
+may retry it), which can cause the destination to receive a duplicate
+delivery. This is deliberate: for a compliance control, a duplicate
+delivery is a nuisance, but a signal that left the bank with no durable
+record of it is a silent gap in what an auditor can be shown. Watch the
+`audit_write_failures` counter on `/metrics` to catch this happening.
+
+`EGRESS_AUDIT_DIR` is unset by default — audit logging is off, with a loud
+startup warning, mirroring `SPOOL_DIR`'s default-off behavior. This package
+never rotates, compresses or expires records; like the standalone sink, old
+files accumulate until an operator archives or deletes them.
+
 ### Environment Variables
 
 | Variable | Required | Description |
@@ -172,6 +208,8 @@ v2's global mosaic had no bank-salt fallback to begin with.
 | `STANDALONE_SINK_DIR` | No | Directory for the local sink's newline-delimited JSON files in `standalone` mode (default: `./sink`; Docker default: `/sink`) |
 | `SPOOL_DIR` | Recommended | Durable queue directory; enables async 202 mode so a destination outage doesn't lose signals (Docker default: `/spool`) |
 | `SPOOL_MAX_DEPTH` | No | Max queued signals before /process returns 503 (default: 10000) |
+| `EGRESS_AUDIT_DIR` | No (recommended for compliance) | Directory for the durable, append-only egress audit log (confirmed deliveries only — see [Egress audit log](#egress-audit-log)). Unset means no audit trail is written, logged loudly at startup |
+| `EGRESS_AUDIT_STORE_PAYLOAD` | No | Set to `true` to store the full delivered payload alongside its digest in the audit log (default: digest-only) |
 | `READINESS_MAX_DEPTH_RATIO` | No | Fraction of `SPOOL_MAX_DEPTH` at/above which `/readyz` reports unhealthy (default: `0.95`). See [API Endpoints](#api-endpoints) — this must never be wired to an auto-restart action. |
 | `READINESS_MAX_STALENESS_SECONDS` | No | How old (in seconds) the oldest pending spool item may get before `/readyz` reports unhealthy (default: `900`, i.e. 15 minutes) |
 | `GATEWAY_PORT` | No | Server port (default: 8080) |
@@ -235,9 +273,11 @@ EdgeGW_Project/
     main.go
   internal/
     adapters/           # Inbound request parsing, Hub forwarding, metrics
+    auditlog/           # Durable, append-only egress audit log (confirmed deliveries only)
     config/             # Configuration loading (env + file)
     middleware/          # Request logging, body size limit
     processor/          # Core anonymization logic + tests
+    spool/              # File-backed durable delivery queue
   deployments/          # Docker Compose + config templates
   scripts/              # Integration test scripts
   .github/workflows/    # CI pipeline

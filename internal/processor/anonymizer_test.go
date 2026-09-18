@@ -423,13 +423,38 @@ func TestAnonymizeSignal_SignalIDUniqueAcrossCalls(t *testing.T) {
 	}
 }
 
-func TestAnonymizeSignal_SignalIDHonoursCallerRef(t *testing.T) {
+func TestAnonymizeSignal_SignalIDDerivedFromCallerRef(t *testing.T) {
+	// signal_id must be DERIVED from a caller-supplied transaction_ref, never
+	// the raw value itself — the raw ref is forwarded to an external vendor
+	// with no hashing anywhere else in the payload, and a format check alone
+	// (transactionRefPattern) cannot distinguish an opaque reference from a
+	// bare BVN/NIN, NUBAN account number, phone number, or a name with
+	// separators stripped.
+	ref := "core-banking-ref-88421"
 	raw := RawData{ID: "1", Name: "Test", Account: "ACC", Amount: 100, Timestamp: "2026-01-01T00:00:00Z",
-		TransactionRef: "core-banking-ref-88421"}
+		TransactionRef: ref}
 
 	sig := AnonymizeSignal(raw, "BNK", "salt", "pepper", 10000)
-	if sig.SignalID != "core-banking-ref-88421" {
-		t.Errorf("expected signal_id to honour caller-supplied transaction_ref, got %q", sig.SignalID)
+	if sig.SignalID == ref {
+		t.Fatalf("signal_id must never equal the raw transaction_ref, got %q", sig.SignalID)
+	}
+	if sig.SignalID == "" {
+		t.Fatal("expected a non-empty derived signal_id")
+	}
+
+	// Determinism: the same ref (and same salt) must derive the same
+	// signal_id every time, so it still works as an idempotency key / join
+	// key the bank can recompute.
+	sigAgain := AnonymizeSignal(raw, "BNK", "salt", "pepper", 10000)
+	if sig.SignalID != sigAgain.SignalID {
+		t.Errorf("expected deterministic signal_id for the same ref, got %q and %q", sig.SignalID, sigAgain.SignalID)
+	}
+
+	// A different bank salt must change the derived signal_id — the vendor,
+	// without BANK_SALT, must not be able to invert or correlate it.
+	sigOtherSalt := AnonymizeSignal(raw, "BNK", "other_salt", "pepper", 10000)
+	if sigOtherSalt.SignalID == sig.SignalID {
+		t.Error("different bank salt must change the derived signal_id")
 	}
 
 	// Whitespace-only ref is treated as absent, same as the other optional
@@ -442,7 +467,7 @@ func TestAnonymizeSignal_SignalIDHonoursCallerRef(t *testing.T) {
 	}
 
 	// Two calls with no ref supplied must not collide with each other or
-	// with the caller-supplied one above.
+	// with the derived signal_id above.
 	rawNoRef := raw
 	rawNoRef.TransactionRef = ""
 	sigA := AnonymizeSignal(rawNoRef, "BNK", "salt", "pepper", 10000)
@@ -451,7 +476,47 @@ func TestAnonymizeSignal_SignalIDHonoursCallerRef(t *testing.T) {
 		t.Error("generated signal_id must differ across calls even with identical input")
 	}
 	if sigA.SignalID == sig.SignalID || sigB.SignalID == sig.SignalID {
-		t.Error("generated signal_id must not collide with a caller-supplied transaction_ref")
+		t.Error("generated signal_id must not collide with a derived signal_id")
+	}
+}
+
+func TestAnonymizeSignal_SignalIDDerivationHidesStructuredPII(t *testing.T) {
+	// transactionRefPattern only screens obviously malformed input; these
+	// values all pass that regex cleanly despite being structured PII
+	// (BVN/NIN-shaped, NUBAN-account-shaped, phone-shaped, name-shaped).
+	// The derivation step, not the regex, is what must keep them from
+	// reaching the vendor verbatim.
+	piiShapedRefs := []struct {
+		name string
+		ref  string
+	}{
+		{"BVN-shaped (11 digits)", "22345678901"},
+		{"NUBAN account-shaped (10 digits)", "0123456789"},
+		{"phone-shaped", "2348012345678"},
+		{"name with space removed", "NgoziAdeyemi"},
+		{"name with underscore", "Ngozi_Adeyemi"},
+	}
+
+	for _, tt := range piiShapedRefs {
+		t.Run(tt.name, func(t *testing.T) {
+			raw := RawData{ID: "1", Name: "Test", Account: "ACC", Amount: 100, Timestamp: "2026-01-01T00:00:00Z",
+				TransactionRef: tt.ref}
+
+			// Confirm the harness assumption: this value passes the input
+			// hygiene regex, so the derivation step is the only thing
+			// standing between it and the vendor.
+			if !transactionRefPattern.MatchString(tt.ref) {
+				t.Fatalf("test setup error: %q was expected to match transactionRefPattern", tt.ref)
+			}
+
+			sig := AnonymizeSignal(raw, "BNK", "salt", "pepper", 10000)
+			if sig.SignalID == tt.ref {
+				t.Errorf("PII-shaped transaction_ref %q must be transformed, not passed through, got signal_id %q", tt.ref, sig.SignalID)
+			}
+			if strings.Contains(sig.SignalID, tt.ref) {
+				t.Errorf("derived signal_id %q must not contain the raw ref %q", sig.SignalID, tt.ref)
+			}
+		})
 	}
 }
 

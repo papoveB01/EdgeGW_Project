@@ -49,23 +49,56 @@ new mosaic scopes.
 | Cross-bank matchability | Broken (bank salt in every mosaic) | Works for `mosaic_scope: "global"` |
 | `mosaic_scope` | absent | **new, always present**: `"global"` or `"local"` |
 | `mosaic_version` | absent | **new, always present**: `2` |
-| `signal_id` | absent | **new, always present**: unique per event, see below |
+| `signal_id` | absent | **new, always present**: unique per event, derived (not echoed) from an optional `transaction_ref` — see below |
 | `feature_version` | absent | **new, always present**: see below |
 | `signal_type` / `endpoint_type` | free-form, unvalidated | **BREAKING**: closed allowlist, case-insensitive match, canonical spelling emitted — see below |
 | `destination_mosaic_scope` | absent | new, present iff `destination_mosaic` is |
 | Timestamp | bucketed, timezone lost | RFC 3339, normalized to UTC, 15-min bucket |
 | `location_zone` | always a geohash (0,0 fabricated when unknown) | geohash-5 or `ZONE_UNKNOWN` |
 
-## `signal_id` — per-event correlation ID
+## `signal_id` — per-event correlation ID (BREAKING CHANGE for `transaction_ref` callers)
 
 `identity_mosaic` is stable per *person* across every transaction, so on its
 own it cannot join a single event to anything. `signal_id` is unique per
-*event*: either the caller-supplied `transaction_ref` from the inbound
-request (trimmed; blank/whitespace-only is treated as absent), or, when not
-supplied, a randomly generated UUIDv4 (`crypto/rand`, never derived from any
-PII field). Consumers that need to correlate a downstream result back to a
-specific transaction — e.g. a fraud-scoring result returned out-of-band by an
-external system — should key that join on `signal_id`, not `identity_mosaic`.
+*event*, derived one of two ways:
+
+- **No `transaction_ref` supplied:** `signal_id` is a randomly generated
+  UUIDv4 (`crypto/rand`), never derived from PII.
+- **`transaction_ref` supplied** (optional inbound field on the request to
+  `/process`; blank/whitespace-only is treated as absent): `signal_id` is
+  **derived**, never the raw value —
+
+  `signal_id = HMAC-SHA256(key = BANK_SALT, msg = "v2|sigid|" + normalized_transaction_ref)`
+
+  using the same `HMACHash`/`NormalizeID` machinery as the mosaics above.
+  **The raw `transaction_ref` is never forwarded to the vendor.** This
+  matters because `transaction_ref` accepts a fairly permissive opaque-token
+  shape (see below) that a bare BVN/NIN, NUBAN account number, or phone
+  number can satisfy just as easily as a real reference ID — deriving
+  `signal_id` via HMAC keeps that value from ever reaching the vendor in
+  recoverable form, while staying **deterministic**: the same
+  `transaction_ref` always produces the same `signal_id` (so it still works
+  as an idempotency key), and the originating bank — which holds
+  `BANK_SALT` — can recompute the same HMAC over its own transaction
+  references to join an out-of-band vendor result back to a transaction.
+  The vendor, without `BANK_SALT`, cannot invert it or correlate references
+  across institutions.
+
+Consumers that need to correlate a downstream result back to a specific
+transaction — e.g. a fraud-scoring result returned out-of-band by an
+external system — should key that join on `signal_id` (recomputed from their
+own `transaction_ref`, if they supplied one), not `identity_mosaic`.
+
+### `transaction_ref` input shape (BREAKING CHANGE)
+
+The inbound `transaction_ref` field must match `^[A-Za-z0-9_-]{1,64}$`
+(alphanumeric, underscore, hyphen; 1–64 characters after trimming
+whitespace). **This is a breaking change**: a `transaction_ref` value that
+was previously accepted unvalidated — free text, punctuation, embedded
+spaces — now gets `400` from `/process`. Note this shape check is input
+hygiene, not the PII boundary: the boundary is that `signal_id` is always
+derived from `transaction_ref` (see above), never the raw value forwarded
+as-is.
 
 ## `feature_version` — versioned feature-shape contract
 

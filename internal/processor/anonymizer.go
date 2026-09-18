@@ -93,14 +93,17 @@ var ValidEndpointTypes = map[string]bool{
 	"IVR":        true,
 }
 
-// transactionRefPattern is the opaque-reference shape RawData.Validate
-// enforces for TransactionRef. TransactionRef becomes AnonymizedSignal's
-// SignalID verbatim and is sent to an external commercial vendor, so it
-// must never be able to smuggle PII (a name, account number, national ID)
-// past every other redaction in this package. Restricting it to a short,
-// alnum/underscore/hyphen token — the shape of a typical opaque core
-// banking reference/UUID — keeps that boundary enforced rather than
-// documented-only.
+// transactionRefPattern is input hygiene for TransactionRef, enforced by
+// RawData.Validate. It is deliberately NOT the PII boundary: a charset
+// check alone cannot tell an opaque reference from a bare BVN/NIN, a NUBAN
+// account number, a phone number, or a name with separators stripped
+// ("NgoziAdeyemi") — all of those match this pattern cleanly. The actual
+// boundary is that TransactionRef is never forwarded as-is; AnonymizeSignal
+// always derives SignalID from it via HMACHash(bankSalt, ...) rather than
+// echoing it, so even a caller that populates this field with real PII
+// never ships that PII to the vendor. This pattern just rejects obviously
+// malformed input (empty after trim is handled separately, wildly long
+// values, embedded whitespace/punctuation) before it reaches that HMAC.
 var transactionRefPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
 
 // RawData represents incoming transaction data with PII and optional fraud-detection fields.
@@ -124,10 +127,13 @@ type RawData struct {
 	EndpointType           string   `json:"endpoint_type,omitempty"`
 	CounterpartyID         string   `json:"counterparty_id,omitempty"`
 	CounterpartyNationalID string   `json:"counterparty_national_id,omitempty"`
-	// TransactionRef is an optional caller-supplied reference used as the
-	// outgoing signal_id (the join key for out-of-band vendor results). It
-	// must be a caller-chosen reference, not PII — when absent, the gateway
-	// generates a random one.
+	// TransactionRef is an optional caller-supplied reference used to derive
+	// the outgoing signal_id (the join key for out-of-band vendor results).
+	// It is never forwarded to the vendor as-is: AnonymizeSignal always
+	// derives signal_id from it with HMACHash(bankSalt, ...), so even if a
+	// caller puts a real identifier here (deliberately or by mistake) it
+	// never reaches the vendor in recoverable form. When absent, the
+	// gateway generates a random signal_id instead.
 	TransactionRef string `json:"transaction_ref,omitempty"`
 }
 
@@ -204,9 +210,14 @@ func (e *ValidationError) Error() string {
 type AnonymizedSignal struct {
 	// SignalID uniquely identifies this event (not the person — see
 	// IdentityMosaic for that). It is the join key the bank uses to match
-	// out-of-band vendor results back to this signal. It is either the
-	// caller-supplied RawData.TransactionRef or a randomly generated value
-	// — never derived from PII.
+	// out-of-band vendor results back to this signal. When RawData.
+	// TransactionRef is supplied, SignalID is HMACHash(bankSalt, "v2|sigid|"
+	// + NormalizeID(ref)) — deterministic (same ref -> same SignalID, so it
+	// still works as an idempotency key) but never the raw ref itself, so a
+	// caller that puts a real identifier in TransactionRef never ships it to
+	// the vendor. The bank recomputes the same HMAC over its own references
+	// to join results back; the vendor, without BANK_SALT, cannot invert it.
+	// When TransactionRef is absent, SignalID is a random UUIDv4 instead.
 	SignalID       string `json:"signal_id"`
 	InstitutionID  string `json:"institution_id"`
 	SignalType     string `json:"signal_type"`
@@ -361,7 +372,8 @@ func BucketTimestamp(ts string) string {
 // reset. If this entropy-failure mode matters for this deployment's threat
 // model, the fix is to make AnonymizeSignal return an error and update
 // processTransaction (and its tests) to log and respond 500 — tracked as
-// follow-up work rather than folded into this change.
+// follow-up work rather than folded into this change; see
+// https://github.com/papoveB01/EdgeGW_Project/issues/4.
 func NewSignalID() string {
 	var b [16]byte
 	if _, err := rand.Read(b[:]); err != nil {
@@ -415,11 +427,22 @@ func AnonymizeSignal(rawPii RawData, institutionID string, salt string, pepper s
 
 	// 6. Per-event correlation ID. IdentityMosaic is per-person and stable
 	// across every transaction, so nothing else in this payload can join a
-	// single event back to a caller-supplied transaction. Prefer the
-	// caller's own reference when supplied; otherwise generate one. Never
+	// single event back to a caller-supplied transaction.
+	//
+	// When the caller supplies a reference, derive signal_id from it rather
+	// than echoing it: TransactionRef's format check (transactionRefPattern
+	// in Validate) only screens obviously malformed input — a bare BVN/NIN,
+	// a NUBAN account number, a phone number, or a name with separators
+	// stripped all pass it cleanly. HMAC-keying with the bank's own salt
+	// keeps the identifier the bank can recompute (same ref -> same
+	// signal_id, so it still works as an idempotency key), while ensuring
+	// nothing recoverable ever reaches the vendor, who never holds
+	// BANK_SALT. When absent, generate a random one instead — still never
 	// derived from PII.
-	signalID := strings.TrimSpace(rawPii.TransactionRef)
-	if signalID == "" {
+	var signalID string
+	if ref := strings.TrimSpace(rawPii.TransactionRef); ref != "" {
+		signalID = HMACHash(salt, "v2|sigid|"+NormalizeID(ref))
+	} else {
 		signalID = NewSignalID()
 	}
 

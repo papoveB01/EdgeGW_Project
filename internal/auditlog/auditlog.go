@@ -22,6 +22,16 @@
 // than inventing a second one. This package does not rotate, compress or
 // expire records; like the standalone sink, retention is the operator's
 // responsibility (see README).
+//
+// Beyond fsyncing the data file, Record also fsyncs the parent directory —
+// but ONLY at the moment a new day file is created, never on ordinary
+// appends. A file's own fsync makes its contents durable but does not, by
+// itself, guarantee the directory entry naming that file is durable too;
+// under a host power loss (not a process crash) a brand-new file can
+// vanish even though its bytes reached disk. See internal/dirsync's doc
+// comment for the full explanation, the deliberate "creation only, not
+// every append" scope, and the deliberate platform assumption (Linux and
+// macOS, matching this project's build/dev targets — not Windows).
 package auditlog
 
 import (
@@ -33,6 +43,8 @@ import (
 	"path/filepath"
 	"sync"
 	"time"
+
+	"github.com/papoveB01/EdgeGW_Project/internal/dirsync"
 )
 
 // Record is one durable audit entry: proof that a specific signal left the
@@ -97,6 +109,15 @@ type Logger struct {
 	mu  sync.Mutex
 	day string
 	f   *os.File
+
+	// syncDir performs the parent-directory fsync described in the package
+	// doc comment. It defaults to dirsync.Sync (the real implementation)
+	// but is a field — rather than a direct dirsync.Sync call — so tests
+	// in this package can substitute an observing stub and assert exactly
+	// when it is (and is not) invoked, without trying to infer fsync
+	// behavior from filesystem introspection, which isn't reliably
+	// observable from a test at all.
+	syncDir func(dir string) error
 }
 
 // New opens (creating if needed) the directory audit records are written
@@ -116,7 +137,7 @@ func New(dir string, storePayload bool) (*Logger, error) {
 	if err := probeWritable(dir); err != nil {
 		return nil, fmt.Errorf("audit log directory %q is not writable: %w", dir, err)
 	}
-	return &Logger{dir: dir, storePayload: storePayload}, nil
+	return &Logger{dir: dir, storePayload: storePayload, syncDir: dirsync.Sync}, nil
 }
 
 // probeWritable verifies dir can actually be written to and fsynced.
@@ -197,6 +218,18 @@ func (l *Logger) Record(destination, signalID string, mosaicVersion, featureVers
 			l.f.Close()
 		}
 		path := filepath.Join(l.dir, "audit-"+day+".ndjson")
+
+		// Determine BEFORE opening whether this call is about to create a
+		// new file, so the directory fsync below only fires on creation,
+		// never on an ordinary re-open of a day file that already exists
+		// (e.g. a process restart on the same UTC day). If Stat fails for
+		// any reason other than "doesn't exist" (permission error, races,
+		// etc.), fail safe toward treating it as a possible creation
+		// rather than skipping a directory fsync that might be needed —
+		// the extra fsync is cheap once per day file; a missed one is not.
+		_, statErr := os.Stat(path)
+		creating := statErr != nil
+
 		f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
 		if err != nil {
 			l.f = nil
@@ -204,6 +237,23 @@ func (l *Logger) Record(destination, signalID string, mosaicVersion, featureVers
 		}
 		l.f = f
 		l.day = day
+
+		if creating {
+			// A failed directory fsync here must NOT be swallowed: this
+			// function has not yet written or synced the record, so
+			// returning early with a non-nil error simply means the
+			// caller (cmd/gateway's auditingForward /
+			// auditingSyncForward) treats this exactly like any other
+			// Record failure — "audit record failed to write" — which
+			// per their documented failure semantics means "not durable
+			// yet", triggering a retry (and possibly a duplicate
+			// delivery) rather than silently losing the record. See
+			// internal/dirsync's doc comment and cmd/gateway/audit.go's
+			// auditingForward doc comment for the full reasoning.
+			if err := l.syncDir(l.dir); err != nil {
+				return fmt.Errorf("failed to fsync audit log directory after creating new day file: %w", err)
+			}
+		}
 	}
 
 	if _, err := l.f.Write(line); err != nil {

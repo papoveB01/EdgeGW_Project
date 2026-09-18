@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"sync"
 	"time"
+
+	"github.com/papoveB01/EdgeGW_Project/internal/dirsync"
 )
 
 // localSink is the standalone-mode delivery destination: in a topology with
@@ -25,6 +27,14 @@ type localSink struct {
 	mu  sync.Mutex
 	day string
 	f   *os.File
+
+	// syncDir performs the parent-directory fsync described in Forward's
+	// doc comment, run only when Forward is about to create a new day
+	// file. It defaults to dirsync.Sync but is a field so tests can
+	// substitute an observing stub and assert exactly when it fires,
+	// rather than trying to infer fsync behavior via filesystem
+	// introspection.
+	syncDir func(dir string) error
 }
 
 // newLocalSink opens (creating if needed) the directory signals are written
@@ -33,7 +43,7 @@ func newLocalSink(dir string) (*localSink, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, fmt.Errorf("failed to create sink dir: %w", err)
 	}
-	return &localSink{dir: dir}, nil
+	return &localSink{dir: dir, syncDir: dirsync.Sync}, nil
 }
 
 // Forward implements spool.ForwardFunc, and is also called directly for
@@ -42,6 +52,22 @@ func newLocalSink(dir string) (*localSink, error) {
 // only ever reported "delivered" once it is actually durable on disk -
 // signals must not silently disappear the way they did against an
 // unreachable placeholder Hub URL.
+//
+// Beyond fsyncing the data file, Forward also fsyncs the parent directory —
+// but ONLY at the moment a new day file is created, never on ordinary
+// appends to a day file that already exists. A file's own fsync makes its
+// contents durable but does not, by itself, guarantee the directory entry
+// naming that file is durable too; under a host power loss (not a process
+// crash) a brand-new file can vanish even though its bytes reached disk.
+// See internal/dirsync's doc comment for the full explanation and the
+// deliberate platform assumption (Linux and macOS, matching this project's
+// build/dev targets — not Windows). A failed directory fsync is returned
+// as an error rather than swallowed, exactly like the existing data-fsync
+// failure just below: this func's caller (spool.forwardOldest, or
+// auditingSyncForward / processTransaction directly in sync mode) treats a
+// non-nil error as "not delivered", causing a retry — consistent with
+// cmd/gateway/audit.go's documented "prefer a duplicate over a silent
+// gap" choice for the sibling audit-log write path.
 func (s *localSink) Forward(_ context.Context, payload []byte) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -52,6 +78,14 @@ func (s *localSink) Forward(_ context.Context, payload []byte) error {
 			s.f.Close()
 		}
 		path := filepath.Join(s.dir, "signals-"+day+".ndjson")
+
+		// See the same "determine before opening" reasoning in
+		// internal/auditlog.Logger.Record: this must only fire on actual
+		// creation, not on every re-open of an already-existing day file
+		// (e.g. after a process restart on the same UTC day).
+		_, statErr := os.Stat(path)
+		creating := statErr != nil
+
 		f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
 		if err != nil {
 			s.f = nil
@@ -59,6 +93,12 @@ func (s *localSink) Forward(_ context.Context, payload []byte) error {
 		}
 		s.f = f
 		s.day = day
+
+		if creating {
+			if err := s.syncDir(s.dir); err != nil {
+				return fmt.Errorf("failed to fsync sink directory after creating new day file: %w", err)
+			}
+		}
 	}
 
 	line := make([]byte, 0, len(payload)+1)

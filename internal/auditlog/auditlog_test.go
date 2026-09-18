@@ -5,6 +5,8 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -269,6 +271,140 @@ func TestNew_FailsFastOnUnwritableDirectory(t *testing.T) {
 	_, err := New(dir, false)
 	if err == nil {
 		t.Fatal("expected New to fail against a read-only directory, not silently succeed and fail later at first delivery")
+	}
+}
+
+// TestRecord_SyncsParentDirOnlyOnNewFileCreation is the key durability
+// test for this change (issue #8): a directory fsync must happen exactly
+// once per newly created day file, and must NOT happen again on
+// subsequent appends to that same file, since re-fsyncing the directory on
+// every record would be pure write amplification on the hot path with no
+// durability benefit (an append doesn't change the directory entry, only
+// the file's own contents, which the existing data fsync already covers).
+//
+// It substitutes an observing stub for Logger.syncDir rather than trying
+// to infer real fsync behavior from the filesystem (not reliably
+// observable from a test at all), and covers both axes: repeated appends
+// within one day, and a rollover to a new day file triggering exactly one
+// more directory fsync.
+func TestRecord_SyncsParentDirOnlyOnNewFileCreation(t *testing.T) {
+	dir := t.TempDir()
+	l, err := New(dir, false)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	t.Cleanup(func() { l.Close() })
+
+	var syncedDirs []string
+	l.syncDir = func(d string) error {
+		syncedDirs = append(syncedDirs, d)
+		return nil
+	}
+
+	day1 := time.Date(2026, 5, 1, 10, 0, 0, 0, time.UTC)
+	payload := []byte(`{}`)
+
+	// First record of the day: creates audit-2026-05-01.ndjson -> exactly
+	// one directory fsync.
+	if err := l.Record("dest", "sig-1", 2, 1, "local", "national_id", payload, day1); err != nil {
+		t.Fatalf("Record 1: %v", err)
+	}
+	if got := len(syncedDirs); got != 1 {
+		t.Fatalf("after creating the first day file: directory fsync count = %d, want 1", got)
+	}
+
+	// Three more appends to the SAME day file: must NOT add any more
+	// directory fsyncs.
+	for i := 0; i < 3; i++ {
+		if err := l.Record("dest", "sig-append", 2, 1, "local", "national_id", payload, day1.Add(time.Duration(i+1)*time.Minute)); err != nil {
+			t.Fatalf("Record append %d: %v", i, err)
+		}
+	}
+	if got := len(syncedDirs); got != 1 {
+		t.Fatalf("after 3 appends to the existing day file: directory fsync count = %d, want still 1 (no fsync on append)", got)
+	}
+
+	// Rolling over to a new UTC day creates a second file -> exactly one
+	// more directory fsync (total 2).
+	day2 := day1.Add(24 * time.Hour)
+	if err := l.Record("dest", "sig-day2", 2, 1, "local", "national_id", payload, day2); err != nil {
+		t.Fatalf("Record day2: %v", err)
+	}
+	if got := len(syncedDirs); got != 2 {
+		t.Fatalf("after rolling over to a new day file: directory fsync count = %d, want 2", got)
+	}
+	for _, d := range syncedDirs {
+		if d != dir {
+			t.Errorf("syncDir called with %q, want %q", d, dir)
+		}
+	}
+}
+
+// TestRecord_ReopeningExistingDayFileDoesNotResync covers the "process
+// restart on the same UTC day" case: a fresh Logger opening a day file
+// that ALREADY EXISTS on disk (created by a previous Logger instance, as
+// TestRecord_SurvivesRestart exercises for durability) must not fsync the
+// directory again — that file's directory entry is already durable from
+// when it was first created.
+func TestRecord_ReopeningExistingDayFileDoesNotResync(t *testing.T) {
+	dir := t.TempDir()
+	deliveredAt := time.Date(2026, 5, 2, 8, 0, 0, 0, time.UTC)
+
+	l1, err := New(dir, false)
+	if err != nil {
+		t.Fatalf("New (first process): %v", err)
+	}
+	if err := l1.Record("dest", "sig-1", 2, 1, "local", "national_id", []byte(`{}`), deliveredAt); err != nil {
+		t.Fatalf("Record (first process): %v", err)
+	}
+	if err := l1.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	l2, err := New(dir, false)
+	if err != nil {
+		t.Fatalf("New (second process): %v", err)
+	}
+	t.Cleanup(func() { l2.Close() })
+
+	var syncedDirs []string
+	l2.syncDir = func(d string) error {
+		syncedDirs = append(syncedDirs, d)
+		return nil
+	}
+
+	if err := l2.Record("dest", "sig-2", 2, 1, "local", "national_id", []byte(`{}`), deliveredAt.Add(time.Hour)); err != nil {
+		t.Fatalf("Record (second process, same day file): %v", err)
+	}
+	if got := len(syncedDirs); got != 0 {
+		t.Errorf("reopening an already-existing day file triggered %d directory fsync(s), want 0", got)
+	}
+}
+
+// TestRecord_DirectoryFsyncFailureIsNotSwallowed pins the failure-semantics
+// requirement from the PR: a directory-fsync failure on new-file creation
+// must propagate as a non-nil error from Record, exactly like any other
+// Record failure, so callers (cmd/gateway's auditingForward /
+// auditingSyncForward) treat the record as NOT durable and retry — never
+// silently treated as success.
+func TestRecord_DirectoryFsyncFailureIsNotSwallowed(t *testing.T) {
+	dir := t.TempDir()
+	l, err := New(dir, false)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	t.Cleanup(func() { l.Close() })
+
+	wantErr := fmt.Errorf("simulated directory fsync failure")
+	l.syncDir = func(d string) error { return wantErr }
+
+	deliveredAt := time.Date(2026, 5, 3, 0, 0, 0, 0, time.UTC)
+	err = l.Record("dest", "sig-1", 2, 1, "local", "national_id", []byte(`{}`), deliveredAt)
+	if err == nil {
+		t.Fatal("expected Record to return an error when the directory fsync fails, got nil")
+	}
+	if !errors.Is(err, wantErr) {
+		t.Errorf("expected returned error to wrap the directory fsync error, got: %v", err)
 	}
 }
 
